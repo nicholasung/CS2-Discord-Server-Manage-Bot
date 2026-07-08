@@ -39,6 +39,7 @@ class ServerManager:
             async for raw in self._proc.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip("\n")
                 self._buffer.append(line)
+                log.info("[GAME] %s", line)
                 for marker in self.cfg.startup_markers:
                     if marker in line:
                         self._seen_markers.add(marker)
