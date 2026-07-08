@@ -66,6 +66,27 @@ systemctl status cs2bot
 journalctl -u cs2bot -f      # bot + server + updater output all live here
 ```
 
+### Alternative: launch in a GUI terminal via cron (no systemd)
+
+If you'd rather see the bot's own console directly in a window on boot — instead of a background systemd service you check with `journalctl` — start it from that user's crontab instead. This needs the same auto-login desktop session as the [interactive console](#what-it-does) does for the CS2 terminal, since cron's `@reboot` jobs get no more of a desktop environment than a systemd service does: no `DISPLAY`, and they can fire before the desktop has even finished logging in.
+
+```bash
+crontab -e
+```
+
+Add a line like:
+
+```cron
+@reboot sleep 30 && DISPLAY=:0 XAUTHORITY=/home/niccs2/.Xauthority xterm -hold -e "cd /home/niccs2/Steam/cs2bot && while true; do CS2BOT_CONFIG=/home/niccs2/Steam/cs2bot/config.json venv/bin/python -m cs2bot.bot; sleep 5; done"
+```
+
+- `sleep 30` gives the desktop session time to finish logging in before cron fires — `@reboot` runs as soon as cron itself starts, which is often before that.
+- `DISPLAY=:0` / `XAUTHORITY=...` — same values (and same X11-vs-Wayland caveat) as the `Environment=` lines in [`systemd/cs2bot.service`](systemd/cs2bot.service); swap to `WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/<uid>` if that desktop is Wayland. `xterm` can be swapped for `gnome-terminal`, `konsole`, etc.
+- `-hold` keeps the xterm window open after the bot process exits, so a crash or a bad `config.json` (e.g. `main()`'s missing-token check) leaves its error on screen instead of the window vanishing immediately.
+- The `while true; do ...; sleep 5; done` loop is standing in for systemd's `Restart=on-failure`/`RestartSec=10` — cron's `@reboot` only fires once at boot, so without it a crashed bot would just sit there with `-hold` until someone notices and restarts it by hand.
+
+Trade-offs versus the systemd unit: no automatic restart if the desktop session itself dies or the box is headless at boot (no session, no window, no bot), no `journalctl` integration, and the bot only starts once that user is logged into a desktop rather than at true boot. Use this if seeing the console matters more than those; otherwise prefer the systemd service and `tmux attach -t cs2-server` for the CS2 console when you need it.
+
 ## Configuration (`config.json`)
 
 | Key | Meaning |
