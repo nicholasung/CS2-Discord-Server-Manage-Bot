@@ -12,10 +12,10 @@
     "password": "CHANGE_ME"
   },
   "server": {
-    "install_dir": "/home/steam/cs2",
+    "install_dir": "/home/USERNAME/cs2",
     "steamcmd": "/usr/games/steamcmd",
     "app_id": 730,
-    "launch_script": "/home/steam/Desktop/start_cs2.sh",
+    "launch_script": "/home/USERNAME/Desktop/start_cs2.sh",
     "launch_cwd": "",
     "start_timeout_seconds": 180,
     "stop_timeout_seconds": 30,
@@ -35,5 +35,5 @@
     "deathmatch":  ["game_type 1", "game_mode 2"],
     "practice":    ["exec MatchZy/prac"]
   },
-  "state_file": "/home/steam/cs2bot/state.json"
+  "state_file": "/home/USERNAME/cs2bot/state.json"
 }
