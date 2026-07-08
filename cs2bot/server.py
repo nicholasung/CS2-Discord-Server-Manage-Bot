@@ -51,6 +51,7 @@ class ServerManager:
         self._buffer = collections.deque(maxlen=cfg.log_buffer_lines)
         self._seen_markers: set[str] = set()
         self._lock = asyncio.Lock()
+        self._plugins_enabled = True
 
     @property
     def is_running(self) -> bool:
@@ -154,8 +155,12 @@ class ServerManager:
 
         log.warning("no terminal emulator found; attach manually with: %s", attach_hint)
 
-    async def start(self):
-        """Launch the server. Does nothing if already running."""
+    async def start(self, plugins_enabled: bool = True):
+        """Launch the server. Does nothing if already running.
+
+        plugins_enabled=False launches CS2 vanilla (no Metamod/CSSharp/
+        MatchZy) -- the fallback used when the current plugin releases
+        don't work with the latest CS2 build; see updater.py."""
         async with self._lock:
             if self.is_running:
                 log.info("start requested but server already running")
@@ -165,14 +170,17 @@ class ServerManager:
             # into this instance's buffer.
             self._buffer = collections.deque(maxlen=self.cfg.log_buffer_lines)
             self._seen_markers = set()
+            self._plugins_enabled = plugins_enabled
 
-            # Verify the Metamod search-path entry is still in gameinfo.gi
-            # before every launch, not just after updates -- a manual game
-            # reinstall or file restore outside the bot's update flow would
-            # otherwise leave it unpatched until the next daily update.
-            # patch_gameinfo() is a no-op if the entry is already present.
+            # Sync the Metamod search-path entry in gameinfo.gi with the
+            # requested mode before every launch, not just after updates --
+            # a manual game reinstall or file restore outside the bot's
+            # update flow would otherwise leave it out of sync until the
+            # next daily update. Both patch/unpatch are no-ops if the file
+            # already matches.
             try:
-                await asyncio.to_thread(plugins.patch_gameinfo, self.cfg.csgo_dir)
+                patch_fn = plugins.patch_gameinfo if plugins_enabled else plugins.unpatch_gameinfo
+                await asyncio.to_thread(patch_fn, self.cfg.csgo_dir)
             except Exception as e:
                 log.error("gameinfo.gi patch failed: %s", e)
 
@@ -290,7 +298,13 @@ class ServerManager:
 
     async def wait_healthy(self) -> bool:
         """Wait until all startup markers appear, or the process dies, or we
-        time out. Returns True only if the server came up cleanly."""
+        time out. Returns True only if the server came up cleanly.
+
+        Uses startup_markers_no_plugins instead of startup_markers when the
+        most recent start() had plugins_enabled=False, since plugin-specific
+        markers (e.g. a CounterStrikeSharp load line) will never appear
+        during a vanilla launch."""
+        markers = self.cfg.startup_markers if self._plugins_enabled else self.cfg.startup_markers_no_plugins
         loop = asyncio.get_event_loop()
         deadline = loop.time() + self.cfg.start_timeout
         while loop.time() < deadline:
@@ -298,19 +312,19 @@ class ServerManager:
                 log.error("server process exited during startup")
                 self._log_tail()
                 return False
-            if self._seen_markers.issuperset(self.cfg.startup_markers):
+            if self._seen_markers.issuperset(markers):
                 log.info("all startup markers seen; server healthy")
                 return True
             await asyncio.sleep(2)
-        missing = set(self.cfg.startup_markers) - self._seen_markers
+        missing = set(markers) - self._seen_markers
         log.error("timed out waiting for startup markers: %s", sorted(missing))
         self._log_tail()
         return False
 
-    async def restart(self) -> bool:
+    async def restart(self, plugins_enabled: bool = True) -> bool:
         """Stop then start, returning the health result of the new instance."""
         await self.stop()
-        await self.start()
+        await self.start(plugins_enabled=plugins_enabled)
         return await self.wait_healthy()
 
     def _log_tail(self, n: int = 25):

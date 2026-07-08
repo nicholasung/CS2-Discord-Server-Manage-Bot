@@ -21,6 +21,7 @@
     "stop_timeout_seconds": 30,
     "log_buffer_lines": 2000,
     "startup_markers": ["Host activate", "CounterStrikeSharp"],
+    "startup_markers_no_plugins": ["Host activate"],
     "nice": 10,
     "tmux_session": "cs2-server",
     "terminal_emulator": "auto"
@@ -29,6 +30,12 @@
     "daily_hour": 6,
     "daily_minute": 30,
     "recovery_interval_hours": 1
+  },
+  "join": {
+    "host": "your.server.ip.or.domain",
+    "port": 27015,
+    "password": "",
+    "refresh_seconds": 60
   },
   "default_map": "de_dust2",
   "gamemodes": {

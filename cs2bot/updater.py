@@ -30,6 +30,7 @@ def load_state(cfg) -> dict:
     data.setdefault("broken", False)
     data.setdefault("installed", {})
     data.setdefault("buildid", "")
+    data.setdefault("plugins_disabled", False)
     return data
 
 
@@ -82,17 +83,44 @@ def _install_plugins_blocking(cfg, names) -> dict:
 
 # ---------- orchestration (async, called by bot loops) ----------
 
+async def restart_with_fallback(cfg, manager, state: dict | None = None) -> bool:
+    """(Re)start the server, trying with plugins first. If that doesn't come
+    up healthy -- e.g. a CS2 update broke Metamod/CSSharp/MatchZy
+    compatibility -- fall back to a vanilla, no-plugin launch so the server
+    stays playable while the recovery loop waits for a working plugin
+    release. Persists the resulting broken/plugins_disabled flags before
+    returning. Returns whether the server ended up running, with or without
+    plugins."""
+    if state is None:
+        state = load_state(cfg)
+
+    healthy = await manager.restart(plugins_enabled=True)
+    if healthy:
+        state["broken"] = False
+        state["plugins_disabled"] = False
+    else:
+        log.warning("server unhealthy with plugins; falling back to a no-plugin launch")
+        healthy = await manager.restart(plugins_enabled=False)
+        state["broken"] = True
+        state["plugins_disabled"] = healthy
+
+    save_state(cfg, state)
+    return healthy
+
+
 async def perform_daily_update(cfg, manager, notify) -> None:
     """Stop server, run steamcmd, and if CS2 changed (or we're recovering
-    from a broken state) update plugins, then start and verify."""
+    from a broken state) update plugins, then start and verify -- falling
+    back to a no-plugin launch if the update broke plugin compatibility."""
     state = load_state(cfg)
     old_build = read_buildid(cfg)
 
     await manager.stop()
     ok = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
     if not ok:
-        # steamcmd failed; bring the server back on the old build and move on
-        await manager.start()
+        # steamcmd failed; bring the server back on the old build, in
+        # whatever plugin mode it was already in, and move on
+        await manager.start(plugins_enabled=not state["plugins_disabled"])
         await manager.wait_healthy()
         await notify("⚠️ CS2 daily update: steamcmd failed; server restarted on the existing build.")
         return
@@ -106,23 +134,26 @@ async def perform_daily_update(cfg, manager, notify) -> None:
         installed = await asyncio.to_thread(_install_plugins_blocking, cfg, plugins.PLUGINS)
         state["installed"].update(installed)
 
-    await manager.start()
-    healthy = await manager.wait_healthy()
-    state["broken"] = not healthy
-    save_state(cfg, state)
+    healthy = await restart_with_fallback(cfg, manager, state)
 
-    if healthy and changed:
-        await notify(f"✅ CS2 updated to build {new_build}; plugins refreshed, server healthy.")
-    elif not healthy:
+    if not healthy:
         await notify(
-            f"❌ CS2 update to build {new_build} left the server unable to start. "
-            "Recovery loop will retry plugin updates hourly until it's back."
+            f"❌ CS2 update to build {new_build} left the server unable to start, even without plugins. "
+            "Check the logs / `/status`."
         )
+    elif state["plugins_disabled"]:
+        await notify(
+            f"⚠️ CS2 updated to build {new_build}, but the plugins failed to start on it. Running "
+            "**without plugins** until a compatible release is available; recovery loop will retry hourly."
+        )
+    elif changed:
+        await notify(f"✅ CS2 updated to build {new_build}; plugins refreshed, server healthy.")
 
 
 async def perform_plugin_reinstall(cfg, manager, notify) -> bool:
     """Force-reinstall every plugin regardless of the recorded version, then
-    restart and verify. Unlike perform_recovery (which only acts when a newer
+    restart and verify (falling back to no-plugin mode if that still doesn't
+    come up healthy). Unlike perform_recovery (which only acts when a newer
     upstream release exists), this always re-extracts the current release --
     the way to unstick a bad or partial install without waiting for upstream
     to publish something new. Returns the health result of the restart."""
@@ -132,24 +163,28 @@ async def perform_plugin_reinstall(cfg, manager, notify) -> bool:
     installed = await asyncio.to_thread(_install_plugins_blocking, cfg, plugins.PLUGINS)
     state["installed"].update(installed)
 
-    await manager.start()
-    healthy = await manager.wait_healthy()
-    state["broken"] = not healthy
-    save_state(cfg, state)
+    healthy = await restart_with_fallback(cfg, manager, state)
 
-    if healthy:
+    if healthy and not state["plugins_disabled"]:
         await notify("✅ Plugins reinstalled on request; server healthy.")
+    elif healthy:
+        await notify(
+            "⚠️ Plugins reinstalled on request, but the server still won't start with them; "
+            "running **without plugins**. Check the logs / `/status`."
+        )
     else:
         await notify(
-            "❌ Plugins reinstalled on request but the server did not come up healthy. "
-            "Check the logs / `/status`."
+            "❌ Plugins reinstalled on request but the server did not come up healthy, even "
+            "without plugins. Check the logs / `/status`."
         )
     return healthy
 
 
 async def perform_recovery(cfg, manager, notify) -> None:
     """Hourly: only acts when the server is flagged broken. Installs any
-    plugin release newer than what's recorded, then restarts and verifies."""
+    plugin release newer than what's recorded, then restarts and verifies.
+    If that still isn't healthy, stays in (or drops into) the no-plugin
+    fallback and waits for the next hour's release check."""
     state = load_state(cfg)
     if not state["broken"]:
         return
@@ -170,11 +205,11 @@ async def perform_recovery(cfg, manager, notify) -> None:
     installed = await asyncio.to_thread(_install_plugins_blocking, cfg, stale)
     state["installed"].update(installed)
 
-    healthy = await manager.restart()
-    state["broken"] = not healthy
-    save_state(cfg, state)
+    healthy = await restart_with_fallback(cfg, manager, state)
 
-    if healthy:
+    if healthy and not state["broken"]:
         await notify(f"✅ Server recovered after updating: {', '.join(stale)}.")
+    elif not healthy:
+        log.error("still unhealthy after updating %s, even without plugins", ", ".join(stale))
     else:
-        log.error("still unhealthy after updating %s", ", ".join(stale))
+        log.info("updated %s but still incompatible; staying in no-plugin fallback", ", ".join(stale))

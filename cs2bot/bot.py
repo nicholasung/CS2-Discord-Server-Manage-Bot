@@ -3,10 +3,12 @@
 One process does everything:
   * launches/supervises the CS2 server as a child (see ServerManager)
   * serves role-gated slash commands
-      Admin role: /restart, /map, /gamemode, /reinstall-plugins, /status
+      Admin role: /join, /restart, /map, /gamemode, /reinstall-plugins, /status
       User role:  recognized, but has no commands yet — add them under the
                   user_only() check when the time comes.
   * runs the daily steamcmd update and the hourly plugin-recovery loops
+  * keeps a pinned "how to join" embed (posted by /join) in sync with
+    whether the server is online -- see joinboard.py
 
 There is no systemd timer and no separate updater process: because the bot
 owns the CS2 process, updates and restarts have to go through it.
@@ -20,7 +22,7 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from . import updater
+from . import joinboard, updater
 from .config import load_config
 from .rcon import rcon_exec
 from .server import ServerManager
@@ -66,19 +68,18 @@ class Cs2Bot(discord.Client):
         else:
             await self.tree.sync()
 
-        # bring the server up as soon as the bot starts
-        await self.manager.start()
-        healthy = await self.manager.wait_healthy()
-        state = updater.load_state(cfg)
-        state["broken"] = not healthy
-        updater.save_state(cfg, state)
+        # bring the server up as soon as the bot starts, falling back to a
+        # no-plugin launch if plugins don't come up healthy
+        await updater.restart_with_fallback(cfg, self.manager)
 
         daily_update_loop.start()
         recovery_loop.start()
+        join_board_loop.start()
 
     async def close(self):
         daily_update_loop.cancel()
         recovery_loop.cancel()
+        join_board_loop.cancel()
         await self.manager.stop()
         await super().close()
 
@@ -121,22 +122,94 @@ async def _rcon(*commands: str) -> str:
     return await asyncio.to_thread(rcon_exec, cfg, *commands)
 
 
+def _connect_string() -> str:
+    connect = f"connect {cfg.join_host}:{cfg.join_port}"
+    if cfg.join_password:
+        connect += f"; password {cfg.join_password}"
+    return connect
+
+
+def _steam_link() -> str:
+    link = f"steam://connect/{cfg.join_host}:{cfg.join_port}"
+    if cfg.join_password:
+        link += f"/{cfg.join_password}"
+    return link
+
+
+def _join_embed() -> discord.Embed:
+    online = bot.manager.is_running
+    embed = discord.Embed(
+        title="🎮 CS2 Server",
+        description=f"**Console:** `{_connect_string()}`\n**Steam:** {_steam_link()}",
+        color=discord.Color.green() if online else discord.Color.red(),
+    )
+    embed.add_field(name="Status", value="🟢 Online" if online else "🔴 Offline")
+    embed.timestamp = discord.utils.utcnow()
+    embed.set_footer(text="Last updated")
+    return embed
+
+
 # ---------------- admin commands ----------------
+
+@bot.tree.command(
+    name="join",
+    description="Post/refresh the pinned join-instructions board in this channel (admin)",
+)
+@admin_only()
+async def join(interaction: discord.Interaction):
+    if not cfg.join_host:
+        await interaction.response.send_message(
+            "⚠️ Join info isn't configured yet — set `join.host` in config.json.",
+            ephemeral=True,
+        )
+        return
+
+    # Retire any previous board (possibly in another channel) so there's
+    # only ever one pinned join message at a time. Best-effort: if it's
+    # already gone, or we lack permission, we just move on and post fresh.
+    old = joinboard.load(cfg)
+    if old.get("message_id"):
+        old_channel = bot.get_channel(old["channel_id"])
+        if old_channel is not None:
+            try:
+                old_message = await old_channel.fetch_message(old["message_id"])
+                await old_message.delete()
+            except discord.DiscordException:
+                pass
+
+    await interaction.response.send_message(embed=_join_embed())
+    message = await interaction.original_response()
+    try:
+        await message.pin()
+        pin_note = ""
+    except discord.DiscordException as e:
+        log.warning("could not pin join board message: %s", e)
+        pin_note = " (couldn't pin it — check my Manage Messages permission)"
+
+    joinboard.save(cfg, {
+        "channel_id": message.channel.id,
+        "message_id": message.id,
+        "online": bot.manager.is_running,
+    })
+    await interaction.followup.send(f"📌 Join board posted{pin_note}.", ephemeral=True)
 
 @bot.tree.command(name="restart", description="Restart the CS2 server (admin)")
 @admin_only()
 async def restart(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    healthy = await bot.manager.restart()
     state = updater.load_state(cfg)
-    state["broken"] = not healthy
-    updater.save_state(cfg, state)
-    if healthy:
+    healthy = await updater.restart_with_fallback(cfg, bot.manager, state)
+    if healthy and not state["plugins_disabled"]:
         await interaction.followup.send("🔄 Server restarted and healthy.")
+    elif healthy:
+        await interaction.followup.send(
+            "⚠️ Server restarted but plugins wouldn't start; running **without plugins**. "
+            "Check the logs / `/status`."
+        )
     else:
         await interaction.followup.send(
-            "⚠️ Server was restarted but did not report healthy within the timeout. "
-            "Check the logs / `/status`."
+            "⚠️ Server was restarted but did not report healthy within the timeout, even "
+            "without plugins. Check the logs / `/status`."
         )
 
 
@@ -196,7 +269,12 @@ async def reinstall_plugins(interaction: discord.Interaction):
 async def status(interaction: discord.Interaction):
     state = updater.load_state(cfg)
     running = "🟢 running" if bot.manager.is_running else "🔴 stopped"
-    broken = " (flagged **broken** — recovery loop active)" if state["broken"] else ""
+    if state["plugins_disabled"]:
+        broken = " (⚠️ **running without plugins** — recovery loop active)"
+    elif state["broken"]:
+        broken = " (flagged **broken** — recovery loop active)"
+    else:
+        broken = ""
     build = state.get("buildid") or "unknown"
     versions = ", ".join(f"{k} {v}" for k, v in state.get("installed", {}).items()) or "unknown"
     await interaction.response.send_message(
@@ -228,8 +306,37 @@ async def recovery_loop():
         log.exception("recovery loop failed")
 
 
+@tasks.loop(seconds=cfg.join_refresh_seconds)
+async def join_board_loop():
+    """Keep the pinned join embed's online/offline status current. Only
+    edits the message when that status actually changed, to avoid
+    needless API calls every tick."""
+    try:
+        board = joinboard.load(cfg)
+        if not board.get("message_id"):
+            return
+        online = bot.manager.is_running
+        if board.get("online") == online:
+            return
+        channel = bot.get_channel(board["channel_id"])
+        if channel is None:
+            return
+        try:
+            message = await channel.fetch_message(board["message_id"])
+            await message.edit(embed=_join_embed())
+        except discord.NotFound:
+            log.warning("join board message no longer exists; clearing it")
+            joinboard.clear(cfg)
+            return
+        board["online"] = online
+        joinboard.save(cfg, board)
+    except Exception:
+        log.exception("join board refresh failed")
+
+
 @daily_update_loop.before_loop
 @recovery_loop.before_loop
+@join_board_loop.before_loop
 async def _wait_ready():
     await bot.wait_until_ready()
 

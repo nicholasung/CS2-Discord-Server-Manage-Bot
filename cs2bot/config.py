@@ -41,6 +41,10 @@ class Config:
         self.stop_timeout = int(s.get("stop_timeout_seconds", 30))
         self.log_buffer_lines = int(s.get("log_buffer_lines", 2000))
         self.startup_markers = s.get("startup_markers", ["Host activate"])
+        # Used when launching without plugins (see the no-plugin fallback in
+        # updater.py): a CS2-only line, since plugin markers like a
+        # CounterStrikeSharp load line will never appear in that mode.
+        self.startup_markers_no_plugins = s.get("startup_markers_no_plugins", ["Host activate"])
         # Niceness for the CS2 child process (0-19; higher = lower priority).
         # Keeps the game server from starving the bot's event loop of CPU
         # time when it's under load, which otherwise shows up as Discord
@@ -60,9 +64,18 @@ class Config:
         self.daily_minute = int(u.get("daily_minute", 30))
         self.recovery_interval_hours = int(u.get("recovery_interval_hours", 1))
 
+        j = raw.get("join", {})
+        self.join_host = j.get("host", "")
+        self.join_port = int(j.get("port", 27015))
+        self.join_password = j.get("password", "")
+        # How often the pinned join-board embed is checked for an online/
+        # offline change and re-edited in place; see joinboard.py.
+        self.join_refresh_seconds = int(j.get("refresh_seconds", 60))
+
         self.default_map = raw.get("default_map", "de_dust2")
         self.gamemodes = raw.get("gamemodes", {})
         self.state_file = Path(raw.get("state_file", "state.json"))
+        self.join_board_file = Path(j.get("board_file") or self.state_file.with_name("join_board.json"))
 
     @property
     def csgo_dir(self) -> Path:

@@ -125,3 +125,27 @@ def patch_gameinfo(csgo_dir: Path):
         )
     gi.write_text(patched, encoding="utf-8")
     log.info("patched gameinfo.gi with metamod entry")
+
+
+def unpatch_gameinfo(csgo_dir: Path):
+    """Remove the Metamod search-path entry inserted by patch_gameinfo(),
+    so CS2 launches without loading Metamod (and therefore CounterStrikeSharp
+    and MatchZy, which load through it) at all. This is how the no-plugin
+    fallback launch is implemented: one edit disables the whole chain
+    without touching any plugin files, and patch_gameinfo() re-adds the
+    entry cleanly on the next normal start. No-op if already absent."""
+    gi = csgo_dir / "gameinfo.gi"
+    text = gi.read_text(encoding="utf-8")
+    if "csgo/addons/metamod" not in text:
+        return
+    patched, n = re.subn(
+        r"^[ \t]*Game[ \t]+csgo/addons/metamod[ \t]*\n\n?",
+        "",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if n == 0:
+        raise RuntimeError("could not find the metamod entry to remove in gameinfo.gi")
+    gi.write_text(patched, encoding="utf-8")
+    log.info("unpatched gameinfo.gi; plugins disabled for this launch")
