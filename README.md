@@ -13,6 +13,7 @@ Manages a CS2 dedicated server (Metamod:Source + CounterStrikeSharp + MatchZy) o
 - **Daily update** (runs at a configurable time, default 06:30): stops the server, runs `steamcmd +login anonymous +app_update 730`, and — if the CS2 buildid changed — updates Metamod, CounterStrikeSharp, and MatchZy to their latest releases and re-patches `gameinfo.gi` (CS2 updates wipe the Metamod entry). Then it starts the server back up and verifies it came up healthy.
 - **No-plugin fallback**: if a CS2 update leaves the server unable to start with plugins (a common occurrence right after a game update, before plugin authors ship a compatible release), the bot automatically restarts it *without* Metamod/CSSharp/MatchZy — by removing the Metamod entry from `gameinfo.gi` — so the server stays up and playable on vanilla CS2 instead of sitting down entirely.
 - **Hourly recovery**: if a start ever fails (with or without plugins), the server is flagged *broken*. Every hour the bot checks whether any of the three plugins has published a newer release; when one has, it installs it and tries restarting with plugins again — falling back to no-plugins once more if that release is still incompatible — repeating until a release actually works and the flag clears. When the server isn't broken, the hourly check is a no-op.
+- **Won't interrupt an active game.** Before the daily update or an hourly recovery restart actually stops/restarts the server, the bot checks the current player count over RCON (`status`). If anyone's connected, it defers — rechecking every `update.player_check_interval_seconds` (default 60) — and only proceeds once the server is empty, posting a status-channel notice when it starts deferring and when it resumes. Manual admin commands (`/restart`, `/reinstall-plugins`) are not gated by this — they act immediately, since an admin invoking them has presumably already decided the disruption is warranted.
 - **No logs on disk.** The bot captures the server's console output into a bounded in-memory ring buffer (`log_buffer_lines`, default 2000) and judges startup health from that. The only file involved is a transient named pipe on tmpfs (`/dev/shm`, RAM-backed) used to feed that buffer — nothing is ever written to real disk, so logs can't fill the drive. steamcmd/plugin output goes only to the systemd journal.
 - **Interactive console.** CS2 runs inside a detached `tmux` session (`server.tmux_session`, default `cs2-server`), so you get a real, typeable console — not just log output — alongside the bot's own health monitoring of the same output. Attach anytime, including over SSH: `tmux attach -t cs2-server` (detach again with `Ctrl-b d` without stopping the server). If a display is available when the bot starts the server, it also best-effort opens a GUI terminal window already attached to that session. This is a convenience on top of, not a replacement for, RCON-based `/map`/`/gamemode` commands.
   > Running under systemd, a plain service has **no** `DISPLAY` — the GUI window won't appear unless you set it. `systemd/cs2bot.service` sets `DISPLAY`/`XAUTHORITY` for a typical single-seat auto-login X11 desktop; if that desktop is Wayland instead, swap them for the commented `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR` lines in the same file. Either way this only works if a real desktop session is actually running on the box (a monitor with auto-login, or something like VNC/x11vnc keeping one up) — a fully headless VM has nowhere for the window to appear, and `tmux attach` over SSH remains the only console access.
@@ -86,6 +87,7 @@ journalctl -u cs2bot -f      # bot + server + updater output all live here
 | `server.terminal_emulator` | GUI terminal to auto-open attached to that session: `"auto"` tries a few common ones, or pin one (`gnome-terminal`, `xterm`, `konsole`, ...); no-op on a headless box |
 | `update.daily_hour` / `daily_minute` | Local time for the daily update run |
 | `update.recovery_interval_hours` | How often to retry recovery while broken (default 1) |
+| `update.player_check_interval_seconds` | While a daily update/recovery restart is deferred for active players, how often to recheck (default 60) |
 | `gamemodes` | Map of mode name → list of RCON commands; `/gamemode` appends a map change |
 | `join.host` | Public IP/hostname players connect to; `/join` refuses to post a board until this is set |
 | `join.port` | Game port players connect to (default `27015`; separate from `rcon.port` if you split them) |
@@ -99,7 +101,8 @@ journalctl -u cs2bot -f      # bot + server + updater output all live here
 ## How the update / recovery cycle behaves
 
 ```
-daily HH:MM  stop server → steamcmd app_update 730
+daily HH:MM  players online? → defer (recheck every player_check_interval_seconds), notify ⏸️/▶️
+             stop server → steamcmd app_update 730
              ├─ steamcmd failed → restart on old build (same plugin mode as before), notify ⚠️
              └─ ok → buildid changed (or was broken)?
                       ├─ no  → just start server back up
@@ -113,7 +116,7 @@ daily HH:MM  stop server → steamcmd app_update 730
 hourly       not broken → no-op
              broken → any plugin released a newer version than installed?
                        ├─ no  → wait for next hour
-                       └─ yes → install it → restart WITH plugins → verify
+                       └─ yes → install it → players online? defer, notify ⏸️/▶️ → restart WITH plugins → verify
                                  ├─ healthy → clear broken, notify ✅
                                  └─ still fails → restart WITHOUT plugins again, stay broken, wait for next hour
 ```

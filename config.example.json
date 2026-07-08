@@ -29,7 +29,8 @@
   "update": {
     "daily_hour": 6,
     "daily_minute": 30,
-    "recovery_interval_hours": 1
+    "recovery_interval_hours": 1,
+    "player_check_interval_seconds": 300
   },
   "join": {
     "host": "your.server.ip.or.domain",

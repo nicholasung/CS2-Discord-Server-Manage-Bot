@@ -15,7 +15,7 @@ import logging
 import re
 import subprocess
 
-from . import plugins
+from . import plugins, rcon
 
 log = logging.getLogger("cs2bot.updater")
 
@@ -83,6 +83,35 @@ def _install_plugins_blocking(cfg, names) -> dict:
 
 # ---------- orchestration (async, called by bot loops) ----------
 
+async def _wait_for_empty_server(cfg, manager, notify, action: str) -> None:
+    """Block until no human players are connected before an automatic
+    action that would disconnect them (stopping/restarting the server for
+    an update). A no-op if the server isn't currently running -- nothing
+    to disturb -- and gives up and proceeds anyway if the player count
+    can't be determined (RCON down, etc.), rather than blocking forever on
+    a check that may never succeed."""
+    if not manager.is_running:
+        return
+
+    deferred = False
+    while True:
+        try:
+            count = await asyncio.to_thread(rcon.player_count, cfg)
+        except Exception as e:
+            log.warning("could not check player count (%s); proceeding with %s", e, action)
+            return
+        if count == 0:
+            if deferred:
+                log.info("server empty; proceeding with %s", action)
+                await notify(f"▶️ Server empty; proceeding with {action}.")
+            return
+        if not deferred:
+            log.info("%d player(s) online; deferring %s until the server is empty", count, action)
+            await notify(f"⏸️ {count} player(s) online; deferring {action} until the server is empty.")
+            deferred = True
+        await asyncio.sleep(cfg.player_check_interval_seconds)
+
+
 async def restart_with_fallback(cfg, manager, state: dict | None = None) -> bool:
     """(Re)start the server, trying with plugins first. If that doesn't come
     up healthy -- e.g. a CS2 update broke Metamod/CSSharp/MatchZy
@@ -115,6 +144,7 @@ async def perform_daily_update(cfg, manager, notify) -> None:
     state = load_state(cfg)
     old_build = read_buildid(cfg)
 
+    await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
     await manager.stop()
     ok = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
     if not ok:
@@ -205,6 +235,7 @@ async def perform_recovery(cfg, manager, notify) -> None:
     installed = await asyncio.to_thread(_install_plugins_blocking, cfg, stale)
     state["installed"].update(installed)
 
+    await _wait_for_empty_server(cfg, manager, notify, "the plugin update")
     healthy = await restart_with_fallback(cfg, manager, state)
 
     if healthy and not state["broken"]:

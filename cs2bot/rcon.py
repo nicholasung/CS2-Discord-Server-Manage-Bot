@@ -1,5 +1,6 @@
 """Minimal Source RCON client (works with CS2)."""
 
+import re
 import socket
 import struct
 
@@ -73,3 +74,17 @@ def rcon_exec(cfg, *commands: str) -> str:
         return "\n".join(client.exec(c) for c in commands)
     finally:
         client.close()
+
+
+_PLAYERS_RE = re.compile(r"players\s*:\s*(\d+)\s+humans?", re.IGNORECASE)
+
+
+def player_count(cfg) -> int:
+    """Number of human players currently connected, parsed from the
+    `status` command's "players : N humans, M bots (K max)" line. Raises
+    RconError if the server can't be reached or the line isn't found."""
+    output = rcon_exec(cfg, "status")
+    m = _PLAYERS_RE.search(output)
+    if not m:
+        raise RconError("could not parse player count from `status` output")
+    return int(m.group(1))

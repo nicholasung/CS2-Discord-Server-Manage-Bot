@@ -63,6 +63,9 @@ class Config:
         self.daily_hour = int(u.get("daily_hour", 6))
         self.daily_minute = int(u.get("daily_minute", 30))
         self.recovery_interval_hours = int(u.get("recovery_interval_hours", 1))
+        # How often to recheck player count while an update/restart is
+        # deferred waiting for the server to empty out.
+        self.player_check_interval_seconds = int(u.get("player_check_interval_seconds", 60))
 
         j = raw.get("join", {})
         self.join_host = j.get("host", "")
