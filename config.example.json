@@ -21,7 +21,9 @@
     "stop_timeout_seconds": 30,
     "log_buffer_lines": 2000,
     "startup_markers": ["Host activate", "CounterStrikeSharp"],
-    "nice": 10
+    "nice": 10,
+    "tmux_session": "cs2-server",
+    "terminal_emulator": "auto"
   },
   "update": {
     "daily_hour": 6,

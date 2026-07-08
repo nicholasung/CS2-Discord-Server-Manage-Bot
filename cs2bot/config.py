@@ -10,6 +10,7 @@ values in the file, so secrets can be kept out of it entirely.
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 
@@ -45,6 +46,14 @@ class Config:
         # time when it's under load, which otherwise shows up as Discord
         # commands timing out while the server is running.
         self.server_nice = int(s.get("nice", 10))
+        # Interactive console: CS2 runs inside this tmux session so a real
+        # terminal can attach and type into it directly, while the bot still
+        # taps its output for health checks. "auto" tries a few common GUI
+        # terminal emulators in order; set explicitly to pin one, or leave
+        # unset entirely on headless boxes (falls back to logging the
+        # manual `tmux attach` command).
+        self.tmux_session = s.get("tmux_session", "cs2-server")
+        self.terminal_emulator = s.get("terminal_emulator", "auto")
 
         u = raw.get("update", {})
         self.daily_hour = int(u.get("daily_hour", 6))
@@ -71,6 +80,8 @@ class Config:
             problems.append(f"server.launch_cwd does not exist: {self.launch_cwd}")
         if not self.install_dir.is_dir():
             problems.append(f"server.install_dir does not exist: {self.install_dir}")
+        if not shutil.which("tmux"):
+            problems.append("tmux is not installed or not on PATH (required to run the CS2 console)")
         if problems:
             raise SystemExit(
                 "Invalid config.json (check for typo'd keys — unknown keys are silently "

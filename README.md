@@ -11,7 +11,8 @@ Manages a CS2 dedicated server (Metamod:Source + CounterStrikeSharp + MatchZy) o
   - **User role**: recognized but has no commands yet (add them with the `user_only()` check in [cs2bot/bot.py](cs2bot/bot.py))
 - **Daily update** (runs at a configurable time, default 06:30): stops the server, runs `steamcmd +login anonymous +app_update 730`, and — if the CS2 buildid changed — updates Metamod, CounterStrikeSharp, and MatchZy to their latest releases and re-patches `gameinfo.gi` (CS2 updates wipe the Metamod entry). Then it starts the server back up and verifies it came up healthy.
 - **Hourly recovery**: if a start ever fails, the server is flagged *broken*. Every hour the bot checks whether any of the three plugins has published a newer release; when one has, it installs it, restarts, and re-verifies — repeating until the server is healthy again. When the server isn't broken, the hourly check is a no-op.
-- **No logs on disk.** The bot captures the server's stdout into a bounded in-memory ring buffer (`log_buffer_lines`, default 2000) and judges startup health from that. Nothing is written to disk, so logs can't fill the drive. steamcmd/plugin output goes only to the systemd journal.
+- **No logs on disk.** The bot captures the server's console output into a bounded in-memory ring buffer (`log_buffer_lines`, default 2000) and judges startup health from that. The only file involved is a transient named pipe on tmpfs (`/dev/shm`, RAM-backed) used to feed that buffer — nothing is ever written to real disk, so logs can't fill the drive. steamcmd/plugin output goes only to the systemd journal.
+- **Interactive console.** CS2 runs inside a detached `tmux` session (`server.tmux_session`, default `cs2-server`), so you get a real, typeable console — not just log output — alongside the bot's own health monitoring of the same output. Attach anytime, including over SSH: `tmux attach -t cs2-server` (detach again with `Ctrl-b d` without stopping the server). If a display is available when the bot starts the server, it also best-effort opens a GUI terminal window already attached to that session. This is a convenience on top of, not a replacement for, RCON-based `/map`/`/gamemode` commands.
 
 ## Prerequisites on the VM
 
@@ -19,9 +20,10 @@ Manages a CS2 dedicated server (Metamod:Source + CounterStrikeSharp + MatchZy) o
 2. **Let the bot be the only launcher.** Once the bot runs, don't also double-click the script — otherwise you'd have two servers fighting for the port. The bot starts the server on boot and restarts it on demand.
 3. **RCON enabled** on the server (`rcon_password` in your server cfg), reachable from the VM itself (`127.0.0.1:27015` by default). Used by `/map` and `/gamemode`.
 4. **steamcmd** installed (`/usr/games/steamcmd` on Debian/Ubuntu).
-5. **Python 3.10+**.
+5. **tmux** installed — the bot runs CS2 inside a tmux session so it has a real interactive console (`sudo apt install tmux` on Debian/Ubuntu). `config.py` fails fast at startup if it's missing.
+6. **Python 3.10+**.
 
-No sudo rule is needed — the bot signals its own child process, it doesn't call systemctl.
+No sudo rule is needed — the bot signals the CS2 process tree directly (via the tmux pane's process group), it doesn't call systemctl.
 
 ## Discord application setup
 
@@ -76,6 +78,8 @@ journalctl -u cs2bot -f      # bot + server + updater output all live here
 | `server.stop_timeout_seconds` | Grace period before SIGTERM escalates to SIGKILL |
 | `server.log_buffer_lines` | Size of the in-memory stdout ring buffer |
 | `server.startup_markers` | Strings that must all appear in stdout for a start to count as healthy |
+| `server.tmux_session` | Name of the tmux session CS2 runs in (default `cs2-server`); `tmux attach -t <name>` for a live console |
+| `server.terminal_emulator` | GUI terminal to auto-open attached to that session: `"auto"` tries a few common ones, or pin one (`gnome-terminal`, `xterm`, `konsole`, ...); no-op on a headless box |
 | `update.daily_hour` / `daily_minute` | Local time for the daily update run |
 | `update.recovery_interval_hours` | How often to retry recovery while broken (default 1) |
 | `gamemodes` | Map of mode name → list of RCON commands; `/gamemode` appends a map change |
