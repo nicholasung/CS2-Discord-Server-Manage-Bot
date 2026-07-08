@@ -57,11 +57,19 @@ def latest_versions() -> dict:
 def _extract_zip(data: bytes, dest: Path):
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         zf.extractall(dest)
-        # zipfile drops unix permissions; restore them (dotnet/.so need +x)
+        # zipfile drops unix permissions; restore them (dotnet/.so need +x).
+        # Always OR in owner rwx/rw on top of whatever the archive stored:
+        # some release zips carry restrictive or missing unix attrs for
+        # directories, and CounterStrikeSharp needs to create files (its log,
+        # configs) under here at runtime. Trusting the stored mode verbatim
+        # can lock the extracting/running user out of its own install -- and
+        # since plugins get reinstalled on every recovery attempt, that would
+        # keep re-clobbering any manual permission fix on the next retry.
         for info in zf.infolist():
+            path = dest / info.filename
             mode = info.external_attr >> 16
-            if mode:
-                os.chmod(dest / info.filename, mode)
+            owner_bits = 0o700 if info.is_dir() else 0o600
+            os.chmod(path, mode | owner_bits)
 
 
 def install(name: str, csgo_dir: Path) -> str:
