@@ -17,6 +17,8 @@ import logging
 import os
 import signal
 
+from . import plugins
+
 log = logging.getLogger("cs2bot.server")
 
 
@@ -56,6 +58,17 @@ class ServerManager:
                 return
             self._buffer.clear()
             self._seen_markers.clear()
+
+            # Verify the Metamod search-path entry is still in gameinfo.gi
+            # before every launch, not just after updates -- a manual game
+            # reinstall or file restore outside the bot's update flow would
+            # otherwise leave it unpatched until the next daily update.
+            # patch_gameinfo() is a no-op if the entry is already present.
+            try:
+                await asyncio.to_thread(plugins.patch_gameinfo, self.cfg.csgo_dir)
+            except Exception as e:
+                log.error("gameinfo.gi patch failed: %s", e)
+
             log.info("launching CS2 via %s (nice %d)", self.cfg.launch_script, self.cfg.server_nice)
             self._proc = await asyncio.create_subprocess_exec(
                 # Wrap in `nice` so the game server yields CPU to the bot's own
