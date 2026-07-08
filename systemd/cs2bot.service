@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=steam
-WorkingDirectory=/home/steam/cs2bot
-Environment=CS2BOT_CONFIG=/home/steam/cs2bot/config.json
-ExecStart=/home/steam/cs2bot/venv/bin/python -m cs2bot.bot
+User=niccs2
+WorkingDirectory=/home/niccs2/Steam/cs2bot
+Environment=CS2BOT_CONFIG=/home/niccs2/Steam/cs2bot/config.json
+ExecStart=/home/niccs2/Steam/cs2bot/venv/bin/python -m cs2bot.bot
 # The bot launches CS2 as a child process, so give it time to stop cleanly.
 TimeoutStopSec=60
 KillMode=mixed

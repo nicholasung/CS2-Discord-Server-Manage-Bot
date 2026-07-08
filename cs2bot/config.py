@@ -54,8 +54,28 @@ class Config:
     def csgo_dir(self) -> Path:
         return self.install_dir / "game" / "csgo"
 
+    def validate(self):
+        """Fail fast and loud on bad paths, instead of dying deep inside
+        asyncio.create_subprocess_exec with a confusing traceback."""
+        problems = []
+        if not Path(self.launch_script).is_file():
+            problems.append(f"server.launch_script does not exist: {self.launch_script}")
+        elif not os.access(self.launch_script, os.X_OK):
+            problems.append(f"server.launch_script is not executable: {self.launch_script}")
+        if not self.launch_cwd.is_dir():
+            problems.append(f"server.launch_cwd does not exist: {self.launch_cwd}")
+        if not self.install_dir.is_dir():
+            problems.append(f"server.install_dir does not exist: {self.install_dir}")
+        if problems:
+            raise SystemExit(
+                "Invalid config.json (check for typo'd keys — unknown keys are silently "
+                "ignored and fall back to placeholder defaults):\n  - " + "\n  - ".join(problems)
+            )
+
 
 def load_config() -> Config:
     path = os.environ.get("CS2BOT_CONFIG") or "config.json"
     with open(path, "r", encoding="utf-8") as f:
-        return Config(json.load(f))
+        cfg = Config(json.load(f))
+    cfg.validate()
+    return cfg
