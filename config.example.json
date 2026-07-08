@@ -1,0 +1,39 @@
+{
+  "discord": {
+    "token": "YOUR_BOT_TOKEN",
+    "guild_id": 0,
+    "admin_roles": ["Admin"],
+    "user_roles": ["User"],
+    "status_channel_id": 0
+  },
+  "rcon": {
+    "host": "127.0.0.1",
+    "port": 27015,
+    "password": "CHANGE_ME"
+  },
+  "server": {
+    "install_dir": "/home/steam/cs2",
+    "steamcmd": "/usr/games/steamcmd",
+    "app_id": 730,
+    "launch_script": "/home/steam/Desktop/start_cs2.sh",
+    "launch_cwd": "",
+    "start_timeout_seconds": 180,
+    "stop_timeout_seconds": 30,
+    "log_buffer_lines": 2000,
+    "startup_markers": ["Host activate", "CounterStrikeSharp"]
+  },
+  "update": {
+    "daily_hour": 6,
+    "daily_minute": 30,
+    "recovery_interval_hours": 1
+  },
+  "default_map": "de_dust2",
+  "gamemodes": {
+    "casual":      ["game_type 0", "game_mode 0"],
+    "competitive": ["game_type 0", "game_mode 1"],
+    "wingman":     ["game_type 0", "game_mode 2"],
+    "deathmatch":  ["game_type 1", "game_mode 2"],
+    "practice":    ["exec MatchZy/prac"]
+  },
+  "state_file": "/home/steam/cs2bot/state.json"
+}
