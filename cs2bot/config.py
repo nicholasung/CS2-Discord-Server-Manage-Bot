@@ -40,6 +40,11 @@ class Config:
         self.stop_timeout = int(s.get("stop_timeout_seconds", 30))
         self.log_buffer_lines = int(s.get("log_buffer_lines", 2000))
         self.startup_markers = s.get("startup_markers", ["Host activate"])
+        # Niceness for the CS2 child process (0-19; higher = lower priority).
+        # Keeps the game server from starving the bot's event loop of CPU
+        # time when it's under load, which otherwise shows up as Discord
+        # commands timing out while the server is running.
+        self.server_nice = int(s.get("nice", 10))
 
         u = raw.get("update", {})
         self.daily_hour = int(u.get("daily_hour", 6))

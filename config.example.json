@@ -20,7 +20,8 @@
     "start_timeout_seconds": 180,
     "stop_timeout_seconds": 30,
     "log_buffer_lines": 2000,
-    "startup_markers": ["Host activate", "CounterStrikeSharp"]
+    "startup_markers": ["Host activate", "CounterStrikeSharp"],
+    "nice": 10
   },
   "update": {
     "daily_hour": 6,

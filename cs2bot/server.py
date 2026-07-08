@@ -56,13 +56,19 @@ class ServerManager:
                 return
             self._buffer.clear()
             self._seen_markers.clear()
-            log.info("launching CS2 via %s", self.cfg.launch_script)
+            log.info("launching CS2 via %s (nice %d)", self.cfg.launch_script, self.cfg.server_nice)
             self._proc = await asyncio.create_subprocess_exec(
+                # Wrap in `nice` so the game server yields CPU to the bot's own
+                # event loop under contention. Without this, CS2 pegging the
+                # CPU starves the bot process of scheduling time and Discord
+                # interactions time out even though the bot itself never
+                # blocks (see rcon_exec/steamcmd, both run via to_thread).
+                #
                 # Run through bash explicitly rather than exec'ing the script
                 # path directly: a direct execve() requires a valid shebang
                 # line with Unix line endings, and fails with ENOEXEC if the
                 # script has no shebang or was saved with CRLF endings.
-                "/bin/bash", self.cfg.launch_script,
+                "nice", "-n", str(self.cfg.server_nice), "/bin/bash", self.cfg.launch_script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(self.cfg.launch_cwd),

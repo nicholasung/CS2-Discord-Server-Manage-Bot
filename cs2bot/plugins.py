@@ -86,19 +86,34 @@ def install(name: str, csgo_dir: Path) -> str:
 
 def patch_gameinfo(csgo_dir: Path):
     """CS2 updates rewrite gameinfo.gi, which removes the Metamod entry.
-    Re-insert it if missing."""
+    Re-insert it if missing, per the official install guide
+    (https://cs2.metamodsource.net/): as the very first SearchPaths entry,
+    immediately before Game_LowViolence, so addons are searched before any
+    other content path."""
     gi = csgo_dir / "gameinfo.gi"
     text = gi.read_text(encoding="utf-8")
     if "csgo/addons/metamod" in text:
         return
     patched, n = re.subn(
-        r"^(\s*)Game\s+csgo\s*$",
-        r"\1Game\tcsgo/addons/metamod\n\1Game\tcsgo",
+        r"^(\s*)Game_LowViolence(\s+)",
+        r"\1Game\2csgo/addons/metamod\n\n\1Game_LowViolence\2",
         text,
         count=1,
         flags=re.MULTILINE,
     )
     if n == 0:
-        raise RuntimeError("could not find 'Game csgo' entry in gameinfo.gi")
+        # No Game_LowViolence entry in this install; fall back to inserting
+        # immediately before "Game csgo" instead.
+        patched, n = re.subn(
+            r"^(\s*)Game\s+csgo\s*$",
+            r"\1Game\tcsgo/addons/metamod\n\1Game\tcsgo",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    if n == 0:
+        raise RuntimeError(
+            "could not find 'Game_LowViolence' or 'Game csgo' entry in gameinfo.gi"
+        )
     gi.write_text(patched, encoding="utf-8")
     log.info("patched gameinfo.gi with metamod entry")
