@@ -57,7 +57,11 @@ class ServerManager:
             self._seen_markers.clear()
             log.info("launching CS2 via %s", self.cfg.launch_script)
             self._proc = await asyncio.create_subprocess_exec(
-                self.cfg.launch_script,
+                # Run through bash explicitly rather than exec'ing the script
+                # path directly: a direct execve() requires a valid shebang
+                # line with Unix line endings, and fails with ENOEXEC if the
+                # script has no shebang or was saved with CRLF endings.
+                "/bin/bash", self.cfg.launch_script,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(self.cfg.launch_cwd),

@@ -60,8 +60,8 @@ class Config:
         problems = []
         if not Path(self.launch_script).is_file():
             problems.append(f"server.launch_script does not exist: {self.launch_script}")
-        elif not os.access(self.launch_script, os.X_OK):
-            problems.append(f"server.launch_script is not executable: {self.launch_script}")
+        elif not os.access(self.launch_script, os.R_OK):
+            problems.append(f"server.launch_script is not readable: {self.launch_script}")
         if not self.launch_cwd.is_dir():
             problems.append(f"server.launch_cwd does not exist: {self.launch_cwd}")
         if not self.install_dir.is_dir():
