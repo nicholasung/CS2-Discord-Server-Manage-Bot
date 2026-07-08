@@ -1,6 +1,6 @@
 [Unit]
 Description=CS2 Discord manager bot (owns and supervises the CS2 server)
-After=network-online.target
+After=network-online.target graphical.target
 Wants=network-online.target
 
 [Service]
@@ -8,6 +8,16 @@ Type=simple
 User=niccs2
 WorkingDirectory=/home/niccs2/Steam/cs2bot
 Environment=CS2BOT_CONFIG=/home/niccs2/Steam/cs2bot/config.json
+# Needed for the bot to pop a GUI terminal window attached to the CS2 tmux
+# session (server.terminal_emulator in config.json). Without these, a
+# system service has no display to connect to, so _spawn_terminal() just
+# logs a `tmux attach` hint instead of opening a window. Values below match
+# a typical single-seat auto-login X11 desktop as user niccs2; if that
+# desktop uses Wayland instead, replace both lines with:
+#   Environment=WAYLAND_DISPLAY=wayland-0
+#   Environment=XDG_RUNTIME_DIR=/run/user/<uid of niccs2>
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/niccs2/.Xauthority
 ExecStart=/home/niccs2/Steam/cs2bot/venv/bin/python -m cs2bot.bot
 # The bot launches CS2 as a child process, so give it time to stop cleanly.
 TimeoutStopSec=60
