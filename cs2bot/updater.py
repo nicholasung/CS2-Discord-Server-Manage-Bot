@@ -120,6 +120,33 @@ async def perform_daily_update(cfg, manager, notify) -> None:
         )
 
 
+async def perform_plugin_reinstall(cfg, manager, notify) -> bool:
+    """Force-reinstall every plugin regardless of the recorded version, then
+    restart and verify. Unlike perform_recovery (which only acts when a newer
+    upstream release exists), this always re-extracts the current release --
+    the way to unstick a bad or partial install without waiting for upstream
+    to publish something new. Returns the health result of the restart."""
+    state = load_state(cfg)
+
+    await manager.stop()
+    installed = await asyncio.to_thread(_install_plugins_blocking, cfg, plugins.PLUGINS)
+    state["installed"].update(installed)
+
+    await manager.start()
+    healthy = await manager.wait_healthy()
+    state["broken"] = not healthy
+    save_state(cfg, state)
+
+    if healthy:
+        await notify("✅ Plugins reinstalled on request; server healthy.")
+    else:
+        await notify(
+            "❌ Plugins reinstalled on request but the server did not come up healthy. "
+            "Check the logs / `/status`."
+        )
+    return healthy
+
+
 async def perform_recovery(cfg, manager, notify) -> None:
     """Hourly: only acts when the server is flagged broken. Installs any
     plugin release newer than what's recorded, then restarts and verifies."""

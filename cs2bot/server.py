@@ -41,7 +41,13 @@ class ServerManager:
             async for raw in self._proc.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip("\n")
                 self._buffer.append(line)
-                log.info("[GAME] %s", line)
+                # DEBUG, not INFO: CS2 is a stdout firehose and this runs in
+                # the event loop, so logging every line at the default level
+                # floods the loop with synchronous write syscalls and starves
+                # Discord interaction handlers of their 3s ACK window (commands
+                # time out). Lines are still retained in the ring buffer above
+                # and surfaced via _log_tail() on failure.
+                log.debug("[GAME] %s", line)
                 for marker in self.cfg.startup_markers:
                     if marker in line:
                         self._seen_markers.add(marker)

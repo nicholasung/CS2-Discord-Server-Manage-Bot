@@ -3,7 +3,7 @@
 One process does everything:
   * launches/supervises the CS2 server as a child (see ServerManager)
   * serves role-gated slash commands
-      Admin role: /restart, /map, /gamemode, /status
+      Admin role: /restart, /map, /gamemode, /reinstall-plugins, /status
       User role:  recognized, but has no commands yet — add them under the
                   user_only() check when the time comes.
   * runs the daily steamcmd update and the hourly plugin-recovery loops
@@ -172,6 +172,23 @@ async def gamemode(interaction: discord.Interaction, mode: str, map: str = ""):
         await interaction.followup.send(f"🎮 Gamemode `{mode}` set, loading `{target}`.")
     except Exception as e:
         await interaction.followup.send(f"❌ RCON error: {e}")
+
+
+@bot.tree.command(
+    name="reinstall-plugins",
+    description="Force-reinstall Metamod/CSSharp/MatchZy and restart (admin)",
+)
+@admin_only()
+async def reinstall_plugins(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    healthy = await updater.perform_plugin_reinstall(cfg, bot.manager, notify)
+    if healthy:
+        await interaction.followup.send("🧩 Plugins reinstalled; server healthy.")
+    else:
+        await interaction.followup.send(
+            "⚠️ Plugins reinstalled but the server did not report healthy within the timeout. "
+            "Check the logs / `/status`."
+        )
 
 
 @bot.tree.command(name="status", description="Show server status (admin)")
