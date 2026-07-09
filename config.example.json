@@ -13,7 +13,7 @@
   },
   "server": {
     "install_dir": "/home/USERNAME/cs2",
-    "steamcmd": "/usr/games/steamcmd",
+    "steamcmd": "steamcmd",
     "app_id": 730,
     "launch_script": "/home/USERNAME/Desktop/start_cs2.sh",
     "launch_cwd": "",

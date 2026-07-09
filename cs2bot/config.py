@@ -32,7 +32,10 @@ class Config:
 
         s = raw.get("server", {})
         self.install_dir = Path(s.get("install_dir", "/home/steam/cs2"))
-        self.steamcmd = s.get("steamcmd", "/usr/games/steamcmd")
+        # Resolved via PATH by default; override with an absolute path only
+        # if steamcmd isn't on PATH. subprocess handles PATH lookup for a
+        # bare name, so no hard-coded install location is assumed.
+        self.steamcmd = s.get("steamcmd", "steamcmd")
         self.app_id = int(s.get("app_id", 730))
         self.launch_script = s.get("launch_script", "/home/steam/Desktop/start_cs2.sh")
         _cwd = s.get("launch_cwd")
@@ -98,6 +101,8 @@ class Config:
             problems.append(f"server.install_dir does not exist: {self.install_dir}")
         if not shutil.which("tmux"):
             problems.append("tmux is not installed or not on PATH (required to run the CS2 console)")
+        if not shutil.which(self.steamcmd):
+            problems.append(f"server.steamcmd not found (not on PATH, or bad path): {self.steamcmd}")
         if problems:
             raise SystemExit(
                 "Invalid config.json (check for typo'd keys — unknown keys are silently "
