@@ -32,6 +32,21 @@ class Config:
 
         s = raw.get("server", {})
         self.install_dir = Path(s.get("install_dir", "/home/steam/cs2"))
+        # The Steam *library root* that holds this game -- the dir whose
+        # steamapps/appmanifest_<app_id>.acf describes the install. steamcmd's
+        # force_install_dir, the buildid read, and scratch cleanup all key off
+        # it; game files / plugins use install_dir. Pointing force_install_dir
+        # at the dir that already has the manifest is what makes steamcmd
+        # update in place instead of writing a duplicate install.
+        #   - Standard Steam library: the game lives at
+        #     <steam_library>/steamapps/common/<name>, so steam_library is a
+        #     few levels ABOVE install_dir (e.g. install_dir
+        #     ".../steamapps/common/Counter Strike Global Offensive",
+        #     steam_library ".../Steam").
+        #   - Flat force_install_dir install: same dir as install_dir -- which
+        #     is the default when this is left blank.
+        _lib = s.get("steam_library")
+        self.steam_library = Path(_lib) if _lib else self.install_dir
         # Resolved via PATH by default; override with an absolute path only
         # if steamcmd isn't on PATH. subprocess handles PATH lookup for a
         # bare name, so no hard-coded install location is assumed.
@@ -111,6 +126,8 @@ class Config:
             problems.append(f"server.launch_cwd does not exist: {self.launch_cwd}")
         if not self.install_dir.is_dir():
             problems.append(f"server.install_dir does not exist: {self.install_dir}")
+        if not self.steam_library.is_dir():
+            problems.append(f"server.steam_library does not exist: {self.steam_library}")
         if not shutil.which("tmux"):
             problems.append("tmux is not installed or not on PATH (required to run the CS2 console)")
         if not shutil.which(self.steamcmd):

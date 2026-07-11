@@ -96,7 +96,8 @@ Trade-offs versus the systemd unit: no automatic restart if the desktop session 
 | `discord.admin_roles` / `user_roles` | Role names (or role IDs as strings) |
 | `discord.status_channel_id` | Optional channel ID for update/failure/recovery notices |
 | `rcon.*` | RCON host/port/password (or `RCON_PASSWORD` env var) |
-| `server.install_dir` | CS2 install root (contains `game/` and `steamapps/`) |
+| `server.install_dir` | The game directory — contains `game/csgo/`. In a standard Steam library this is `<steam_library>/steamapps/common/Counter Strike Global Offensive` |
+| `server.steam_library` | The Steam **library root** holding the game (the dir with `steamapps/appmanifest_730.acf`), used for `force_install_dir`, the buildid read, and scratch cleanup. Leave `""` for a flat `force_install_dir` install (defaults to `install_dir`); for a standard library set it a few levels up, e.g. `/home/USER/Steam`. **Getting this wrong makes steamcmd write a duplicate install instead of updating in place** — see below |
 | `server.launch_script` | Your existing launcher; the bot runs this to start the server |
 | `server.launch_cwd` | Working dir for the launcher (defaults to the script's folder) |
 | `server.start_timeout_seconds` | How long to wait for startup markers before calling a start failed |
@@ -118,6 +119,8 @@ Trade-offs versus the systemd unit: no automatic restart if the desktop session 
 | `join.refresh_seconds` | How often the pinned join board is checked for an online/offline change (default 60) |
 | `join.board_file` | Small JSON file tracking the pinned board's channel/message ID (defaults next to `state_file`) |
 | `state_file` | Small JSON file: last buildid, installed plugin versions, broken flag, plugins_disabled flag |
+
+> **Install layout / `steam_library`.** The bot updates CS2 with `steamcmd +force_install_dir <steam_library> +app_update 730`. steamcmd updates *in place* only when it points at the directory that already holds `steamapps/appmanifest_730.acf` — the **library root**. If `force_install_dir` points at the game folder instead (which has no manifest), steamcmd installs a *fresh duplicate copy* there rather than updating the real one — silently doubling disk usage and never actually patching the running server. So for a standard Steam library (`.../Steam/steamapps/common/Counter Strike Global Offensive`), set `install_dir` to the game folder and `steam_library` to the library root (`.../Steam`). For a self-contained `force_install_dir` install the two are the same dir; leave `steam_library` blank.
 
 > **Startup markers matter.** Pick strings you *know* appear in your server's stdout on a good boot and *don't* on a failed one — e.g. a CounterStrikeSharp load line plus a "host activate" style line. If they're too loose the bot may think a broken start succeeded; too strict and it may flag a healthy start as broken. Watch a normal boot's output once and choose accordingly. `startup_markers_no_plugins` should only contain CS2-level lines (no CounterStrikeSharp/MatchZy strings) since those never appear during a no-plugin fallback launch.
 
@@ -155,7 +158,7 @@ Plugin sources: Metamod:Source dev builds from `mms.alliedmods.net`, CounterStri
 
 When `steamcmd` aborts an update for lack of space (it reports `Error! App '730' state is 0x202` and exits `8`, having transferred nothing), the bot frees room and retries the update once.
 
-**By default (no config), it clears steamcmd's own scratch/staging dirs** — `steamapps/downloading` and `steamapps/temp`, i.e. partial downloads and temp files left by interrupted updates. These are never installed game content and steamcmd regenerates them, so this is always safe. It reclaims *stale* leftovers from earlier failed runs; it won't fix a fundamentally too-small disk (the retry re-downloads the current update's data).
+**By default (no config), it clears steamcmd's own scratch/staging dirs** — `<steam_library>/steamapps/downloading` and `.../temp`, i.e. partial downloads and temp files left by interrupted updates. These are never installed game content and steamcmd regenerates them, so this is always safe. It reclaims *stale* leftovers from earlier failed runs; it won't fix a fundamentally too-small disk (the retry re-downloads the current update's data).
 
 **For a genuine shortage** — where the install itself no longer fits with headroom — you can additionally list game content to delete via `update.prune_paths`. This is opt-in because CS2 packs most assets (maps, models, sounds) into `pak01_*.vpk` archives the **server also needs**, so there's no large safe list to ship:
 

@@ -48,7 +48,7 @@ def save_state(cfg, state: dict):
 # ---------- steamcmd ----------
 
 def read_buildid(cfg) -> str:
-    manifest = cfg.install_dir / "steamapps" / f"appmanifest_{cfg.app_id}.acf"
+    manifest = cfg.steam_library / "steamapps" / f"appmanifest_{cfg.app_id}.acf"
     try:
         m = re.search(r'"buildid"\s+"(\d+)"', manifest.read_text(encoding="utf-8"))
         return m.group(1) if m else ""
@@ -75,7 +75,7 @@ def _run_steamcmd_once(cfg) -> tuple[int, str]:
     classified. Returns (returncode, tail_text)."""
     cmd = [
         cfg.steamcmd,
-        "+force_install_dir", str(cfg.install_dir),
+        "+force_install_dir", str(cfg.steam_library),
         "+login", "anonymous",
         "+app_update", str(cfg.app_id),
         "+quit",
@@ -106,10 +106,11 @@ def _classify_steamcmd_failure(returncode: int, output: str) -> tuple[str, str]:
     return f"steamcmd exited with code {returncode}", "other"
 
 
-# steamcmd's own scratch/staging dirs (relative to install_dir): partial
-# downloads and temp files left by an interrupted update. Never installed game
-# content, regenerated on demand, so always safe to clear when we need room --
-# done automatically on a disk-full failure, ahead of any user prune_paths.
+# steamcmd's own scratch/staging dirs (relative to the Steam library root):
+# partial downloads and temp files left by an interrupted update. Never
+# installed game content, regenerated on demand, so always safe to clear when
+# we need room -- done automatically on a disk-full failure, ahead of any user
+# prune_paths.
 _STEAMCMD_SCRATCH = ("steamapps/downloading", "steamapps/temp")
 
 
@@ -131,20 +132,25 @@ def _path_size(path: Path) -> int:
 def _free_disk_space(cfg) -> int:
     """Make room for an update that failed for lack of space. Always clears
     steamcmd's scratch/staging dirs first (safe leftovers from interrupted
-    runs), then deletes any configured prune_paths -- client-only content a
-    dedicated server doesn't need. A plain app_update won't re-download pruned
-    content (only a `validate` would, which the bot never runs), so the space
-    stays freed. Safety rails: never removes a symlink (would drop
-    custom-content links), never a path listed in `symlinks`, and never
-    anything outside install_dir. Returns bytes freed."""
-    install_root = cfg.install_dir.resolve()
+    runs, under the Steam library root), then deletes any configured
+    prune_paths -- client-only content a dedicated server doesn't need, under
+    the game dir. A plain app_update won't re-download pruned content (only a
+    `validate` would, which the bot never runs), so the space stays freed.
+    Safety rails: never removes a symlink (would drop custom-content links),
+    never a path listed in `symlinks`, and never anything outside the library
+    root. Returns bytes freed."""
+    lib_root = cfg.steam_library.resolve()
     protected = {os.path.realpath(s["link"]) for s in cfg.symlinks if s.get("link")}
     freed = 0
-    for pattern in (*_STEAMCMD_SCRATCH, *cfg.prune_paths):
+    # scratch dirs are relative to the library root; prune_paths (game content)
+    # are relative to the game dir.
+    targets = [(cfg.steam_library, p) for p in _STEAMCMD_SCRATCH]
+    targets += [(cfg.install_dir, p) for p in cfg.prune_paths]
+    for base, pattern in targets:
         try:
-            matched = list(cfg.install_dir.glob(pattern))
+            matched = list(base.glob(pattern))
         except ValueError as e:
-            log.warning("prune: bad pattern %r (use a path relative to install_dir): %s", pattern, e)
+            log.warning("prune: bad pattern %r (use a path relative to its base): %s", pattern, e)
             continue
         if not matched:
             log.info("prune: nothing matched %r", pattern)
@@ -153,8 +159,8 @@ def _free_disk_space(cfg) -> int:
             if path.is_symlink():
                 continue
             real = path.resolve()
-            if install_root not in real.parents:
-                log.warning("prune: skipping %s (not inside install_dir)", path)
+            if lib_root not in real.parents:
+                log.warning("prune: skipping %s (outside %s)", path, lib_root)
                 continue
             if str(real) in protected:
                 continue
