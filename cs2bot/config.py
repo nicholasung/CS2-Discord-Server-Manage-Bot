@@ -69,6 +69,18 @@ class Config:
         # How often to recheck player count while an update/restart is
         # deferred waiting for the server to empty out.
         self.player_check_interval_seconds = int(u.get("player_check_interval_seconds", 60))
+        # Disk-full recovery. When steamcmd aborts for lack of space, the bot
+        # always clears steamcmd's own scratch/staging dirs, then deletes these
+        # extra paths (globs, relative to install_dir) before retrying once.
+        # Meant for client-only content a dedicated server doesn't need; a
+        # plain app_update won't re-download them (only a `validate` would,
+        # which the bot never runs). Symlinks and anything in `symlinks` are
+        # never touched. Empty (default) = scratch cleanup only.
+        self.prune_paths = [str(p) for p in u.get("prune_paths", [])]
+        # Custom-content symlinks to (re)create after any update/prune, so
+        # maps/cfgs linked into the install dir survive. Each entry is
+        # {"link": <path>, "target": <path>}.
+        self.symlinks = [dict(s) for s in u.get("symlinks", [])]
 
         j = raw.get("join", {})
         self.join_host = j.get("host", "")

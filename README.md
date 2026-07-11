@@ -109,6 +109,8 @@ Trade-offs versus the systemd unit: no automatic restart if the desktop session 
 | `update.daily_hour` / `daily_minute` | Local time for the daily update run |
 | `update.recovery_interval_hours` | How often to retry recovery while broken (default 1) |
 | `update.player_check_interval_seconds` | While a daily update/recovery restart is deferred for active players, how often to recheck (default 60) |
+| `update.prune_paths` | Extra globs (relative to `install_dir`) deleted to free space on a disk-full update, on top of the always-safe scratch cleanup, before one automatic retry. For client-only content a dedicated server doesn't need. Empty (default) = scratch cleanup only. See [Disk-full recovery](#disk-full-recovery) |
+| `update.symlinks` | Custom-content symlinks — `[{"link": ..., "target": ...}]` — re-created after any update/prune so maps/cfgs linked into the install dir survive. Never deleted by pruning |
 | `gamemodes` | Map of mode name → list of RCON commands; `/gamemode` appends a map change |
 | `join.host` | Public IP/hostname players connect to; `/join` refuses to post a board until this is set |
 | `join.port` | Game port players connect to (default `27015`; separate from `rcon.port` if you split them) |
@@ -124,7 +126,10 @@ Trade-offs versus the systemd unit: no automatic restart if the desktop session 
 ```
 daily HH:MM  players online? → defer (recheck every player_check_interval_seconds), notify ⏸️/▶️
              stop server → steamcmd app_update 730
-             ├─ steamcmd failed → restart on old build (same plugin mode as before), notify ⚠️
+             ├─ steamcmd failed → classify:
+             │    ├─ transient (content servers / 0x202) → retry w/ backoff (up to 3x)
+             │    ├─ disk full → clear steamcmd scratch (+ prune_paths), retry once
+             │    └─ still failing → restart on old build (same plugin mode), notify ⚠️ with reason
              └─ ok → buildid changed (or was broken)?
                       ├─ no  → just start server back up
                       └─ yes → install latest metamod/cssharp/matchzy
@@ -145,3 +150,30 @@ hourly       not broken → no-op
 Plugin sources: Metamod:Source dev builds from `mms.alliedmods.net`, CounterStrikeSharp (`with-runtime` linux build) and MatchZy from their GitHub latest releases.
 
 > Plugin archives are extracted over the existing install, refreshing plugin binaries but leaving files that only exist locally (e.g. your `admins.json`, MatchZy config edits) in place unless the release ships the same file.
+
+## Disk-full recovery
+
+When `steamcmd` aborts an update for lack of space (it reports `Error! App '730' state is 0x202` and exits `8`, having transferred nothing), the bot frees room and retries the update once.
+
+**By default (no config), it clears steamcmd's own scratch/staging dirs** — `steamapps/downloading` and `steamapps/temp`, i.e. partial downloads and temp files left by interrupted updates. These are never installed game content and steamcmd regenerates them, so this is always safe. It reclaims *stale* leftovers from earlier failed runs; it won't fix a fundamentally too-small disk (the retry re-downloads the current update's data).
+
+**For a genuine shortage** — where the install itself no longer fits with headroom — you can additionally list game content to delete via `update.prune_paths`. This is opt-in because CS2 packs most assets (maps, models, sounds) into `pak01_*.vpk` archives the **server also needs**, so there's no large safe list to ship:
+
+```jsonc
+"update": {
+  "prune_paths": [
+    // ONLY paths you've confirmed a headless server boots and loads maps without.
+    // e.g. client-only UI videos, if present on your build:
+    "game/csgo/panorama/videos"
+  ],
+  "symlinks": [
+    { "link": "/home/USER/cs2/game/csgo/maps/workshop", "target": "/home/USER/cs2-workshop-maps" }
+  ]
+}
+```
+
+- `prune_paths` are globs **relative to `install_dir`**. Verify each one against your own install before adding it — a wrong entry (e.g. a VPK the server needs) breaks map loading.
+- **Safety rails:** pruning never removes a symlink, never removes a path listed in `symlinks`, and never touches anything outside `install_dir`. If nothing can be freed, the update just fails cleanly onto the old build — it won't loop.
+- `symlinks` you've linked *into* the install dir (custom maps/cfgs) are re-created after every update or prune, so they self-heal if anything removes them.
+
+> **Why the freed space stays freed:** the bot only ever runs a plain `app_update`, which trusts the local manifest and won't re-download files you deleted. Do **not** run `steamcmd +app_update 730 validate` against this install — a `validate` re-hashes everything and pulls the pruned content back, refilling the disk.

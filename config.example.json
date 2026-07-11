@@ -30,7 +30,9 @@
     "daily_hour": 6,
     "daily_minute": 30,
     "recovery_interval_hours": 1,
-    "player_check_interval_seconds": 300
+    "player_check_interval_seconds": 300,
+    "prune_paths": [],
+    "symlinks": []
   },
   "join": {
     "host": "your.server.ip.or.domain",

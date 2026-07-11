@@ -10,10 +10,16 @@ plugin versions, and a "broken" flag that the recovery loop watches.
 """
 
 import asyncio
+import collections
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
+import sys
+import time
+from pathlib import Path
 
 from . import plugins, rcon
 
@@ -50,7 +56,23 @@ def read_buildid(cfg) -> str:
         return ""
 
 
-def _run_steamcmd_blocking(cfg) -> bool:
+# steamcmd retries transient content-server/network failures with backoff; a
+# permanent failure like a full disk is reported at once without wasting them.
+STEAMCMD_MAX_ATTEMPTS = 3
+STEAMCMD_RETRY_BACKOFF_SECONDS = 30
+
+# Output signatures that mean retrying won't help (the disk is full). Anything
+# else that fails -- notably an update aborted pre-download in state 0x202 --
+# is treated as a transient Steam content-server hiccup and retried.
+_DISK_FULL_RE = re.compile(
+    r"not enough disk space|disk write failure|no space left", re.IGNORECASE
+)
+
+
+def _run_steamcmd_once(cfg) -> tuple[int, str]:
+    """One steamcmd invocation. Relays output live to stdout (-> journald, as
+    before) while retaining the tail so a failure's real reason can be
+    classified. Returns (returncode, tail_text)."""
     cmd = [
         cfg.steamcmd,
         "+force_install_dir", str(cfg.install_dir),
@@ -58,13 +80,156 @@ def _run_steamcmd_blocking(cfg) -> bool:
         "+app_update", str(cfg.app_id),
         "+quit",
     ]
+    tail: collections.deque = collections.deque(maxlen=40)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    # Relay raw lines straight to stdout (not through logging) so the journald
+    # volume matches the old inherited-fd behavior, while keeping the tail.
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        tail.append(line.rstrip("\n"))
+    proc.wait()
+    sys.stdout.flush()
+    return proc.returncode, "\n".join(tail)
+
+
+def _classify_steamcmd_failure(returncode: int, output: str) -> tuple[str, str]:
+    """Map a failed run to (human_reason, kind). kind drives what happens next:
+    'disk_full' -> prune configured client-only content and retry (retrying
+    alone won't help); 'content_servers' / 'other' -> transient, retry with
+    backoff."""
+    if _DISK_FULL_RE.search(output):
+        return "not enough disk space on the install volume", "disk_full"
+    if "0x202" in output:
+        return "Steam content servers unavailable (update aborted, state 0x202)", "content_servers"
+    return f"steamcmd exited with code {returncode}", "other"
+
+
+# steamcmd's own scratch/staging dirs (relative to install_dir): partial
+# downloads and temp files left by an interrupted update. Never installed game
+# content, regenerated on demand, so always safe to clear when we need room --
+# done automatically on a disk-full failure, ahead of any user prune_paths.
+_STEAMCMD_SCRATCH = ("steamapps/downloading", "steamapps/temp")
+
+
+def _path_size(path: Path) -> int:
+    """Bytes used by a file or (recursively) a directory, not following
+    symlinks."""
+    if path.is_file():
+        return path.stat().st_size
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _free_disk_space(cfg) -> int:
+    """Make room for an update that failed for lack of space. Always clears
+    steamcmd's scratch/staging dirs first (safe leftovers from interrupted
+    runs), then deletes any configured prune_paths -- client-only content a
+    dedicated server doesn't need. A plain app_update won't re-download pruned
+    content (only a `validate` would, which the bot never runs), so the space
+    stays freed. Safety rails: never removes a symlink (would drop
+    custom-content links), never a path listed in `symlinks`, and never
+    anything outside install_dir. Returns bytes freed."""
+    install_root = cfg.install_dir.resolve()
+    protected = {os.path.realpath(s["link"]) for s in cfg.symlinks if s.get("link")}
+    freed = 0
+    for pattern in (*_STEAMCMD_SCRATCH, *cfg.prune_paths):
+        try:
+            matched = list(cfg.install_dir.glob(pattern))
+        except ValueError as e:
+            log.warning("prune: bad pattern %r (use a path relative to install_dir): %s", pattern, e)
+            continue
+        if not matched:
+            log.info("prune: nothing matched %r", pattern)
+            continue
+        for path in matched:
+            if path.is_symlink():
+                continue
+            real = path.resolve()
+            if install_root not in real.parents:
+                log.warning("prune: skipping %s (not inside install_dir)", path)
+                continue
+            if str(real) in protected:
+                continue
+            try:
+                size = _path_size(path)
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+                freed += size
+                log.info("prune: removed %s (%.1f GB)", path, size / 1e9)
+            except OSError as e:
+                log.warning("prune: could not remove %s: %s", path, e)
+    if freed:
+        log.info("prune: freed %.1f GB total", freed / 1e9)
+    return freed
+
+
+def _ensure_symlinks(cfg) -> None:
+    """Recreate any configured custom-content symlinks that have gone missing,
+    so an update or a prune can never leave the server without its linked
+    maps/cfgs. Existing links (and real files at the link path) are left
+    alone."""
+    for s in cfg.symlinks:
+        link, target = s.get("link"), s.get("target")
+        if not link or not target:
+            continue
+        link_p = Path(link)
+        if link_p.is_symlink() or link_p.exists():
+            continue
+        try:
+            link_p.parent.mkdir(parents=True, exist_ok=True)
+            link_p.symlink_to(target)
+            log.info("recreated symlink %s -> %s", link, target)
+        except OSError as e:
+            log.error("could not recreate symlink %s -> %s: %s", link, target, e)
+
+
+def _run_steamcmd_blocking(cfg) -> tuple[bool, str]:
+    """Run steamcmd, recovering where we can: transient (content-server/network)
+    failures are retried with backoff; a disk-full failure triggers a one-time
+    prune of configured client-only content, then a retry. Configured symlinks
+    are re-verified after any run that touched files. Returns (ok, reason);
+    reason is a short human-readable string on failure and "" on success."""
     log.info("running steamcmd app_update %s", cfg.app_id)
-    # steamcmd output streams to our stdout -> journald; nothing goes to disk
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        log.error("steamcmd exited with %s", result.returncode)
-        return False
-    return True
+    reason = ""
+    pruned = False
+    for attempt in range(1, STEAMCMD_MAX_ATTEMPTS + 1):
+        returncode, output = _run_steamcmd_once(cfg)
+        if returncode == 0:
+            _ensure_symlinks(cfg)
+            return True, ""
+        reason, kind = _classify_steamcmd_failure(returncode, output)
+        log.error(
+            "steamcmd failed (attempt %d/%d): %s",
+            attempt, STEAMCMD_MAX_ATTEMPTS, reason,
+        )
+
+        if kind == "disk_full" and not pruned:
+            pruned = True
+            freed = _free_disk_space(cfg)
+            _ensure_symlinks(cfg)
+            if freed > 0:
+                log.info("freed %.1f GB; retrying update immediately", freed / 1e9)
+                continue  # retry now; the space problem should be gone
+            log.error("nothing to free (no scratch leftovers, no prune_paths matched)")
+            break
+
+        transient = kind in ("content_servers", "other")
+        if not transient or attempt == STEAMCMD_MAX_ATTEMPTS:
+            break
+        backoff = STEAMCMD_RETRY_BACKOFF_SECONDS * attempt
+        log.info("retrying steamcmd in %ds", backoff)
+        time.sleep(backoff)
+    return False, reason
 
 
 def _install_plugins_blocking(cfg, names) -> dict:
@@ -146,13 +311,15 @@ async def perform_daily_update(cfg, manager, notify) -> None:
 
     await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
     await manager.stop()
-    ok = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
+    ok, reason = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
     if not ok:
         # steamcmd failed; bring the server back on the old build, in
         # whatever plugin mode it was already in, and move on
         await manager.start(plugins_enabled=not state["plugins_disabled"])
         await manager.wait_healthy()
-        await notify("⚠️ CS2 daily update: steamcmd failed; server restarted on the existing build.")
+        await notify(
+            f"⚠️ CS2 daily update failed ({reason}); server restarted on the existing build."
+        )
         return
 
     new_build = read_buildid(cfg)
