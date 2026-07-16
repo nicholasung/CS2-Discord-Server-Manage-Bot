@@ -69,17 +69,21 @@ _DISK_FULL_RE = re.compile(
 )
 
 
-def _run_steamcmd_once(cfg) -> tuple[int, str]:
-    """One steamcmd invocation. Relays output live to stdout (-> journald, as
-    before) while retaining the tail so a failure's real reason can be
-    classified. Returns (returncode, tail_text)."""
-    cmd = [
+def _steamcmd_cmd(cfg) -> list[str]:
+    return [
         cfg.steamcmd,
         "+force_install_dir", str(cfg.steam_library),
         "+login", "anonymous",
         "+app_update", str(cfg.app_id),
         "+quit",
     ]
+
+
+def _run_steamcmd_once(cfg) -> tuple[int, str]:
+    """One steamcmd invocation. Relays output live to stdout (-> journald, as
+    before) while retaining the tail so a failure's real reason can be
+    classified. Returns (returncode, tail_text)."""
+    cmd = _steamcmd_cmd(cfg)
     tail: collections.deque = collections.deque(maxlen=40)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
@@ -103,6 +107,15 @@ def _classify_steamcmd_failure(returncode: int, output: str) -> tuple[str, str]:
         return "not enough disk space on the install volume", "disk_full"
     if "0x202" in output:
         return "Steam content servers unavailable (update aborted, state 0x202)", "content_servers"
+    if returncode == 254 or "needs to be online" in output.lower():
+        # steamcmd's own startup self-update died before +login was even
+        # parsed. Despite the message it prints, an unwritable steamcmd
+        # state dir is as common a cause as an actually blocked connection.
+        return (
+            "steamcmd's startup self-update failed (exit 254; unwritable "
+            "steamcmd state dir, or Steam client CDN unreachable)",
+            "other",
+        )
     return f"steamcmd exited with code {returncode}", "other"
 
 
@@ -199,20 +212,49 @@ def _ensure_symlinks(cfg) -> None:
             log.error("could not recreate symlink %s -> %s: %s", link, target, e)
 
 
-def _run_steamcmd_blocking(cfg) -> tuple[bool, str]:
+# Discord rejects messages over this many characters; debug tails are
+# trimmed (oldest lines first) to stay under it.
+_DISCORD_MESSAGE_LIMIT = 2000
+
+
+def with_debug_tail(message: str, detail: str) -> str:
+    """Append `detail` to a status message as a code block so failure
+    notifications carry the actual error output instead of only a one-line
+    summary. Oldest lines are trimmed first to respect Discord's message
+    length limit; the end of the output is where the real error lives."""
+    detail = (detail or "").strip()
+    if not detail:
+        return message
+    room = _DISCORD_MESSAGE_LIMIT - len(message) - len("\n```text\n\n```")
+    if room <= 0:
+        return message
+    if len(detail) > room:
+        detail = detail[-room:]
+        nl = detail.find("\n")
+        if nl != -1:
+            detail = detail[nl + 1:]  # drop the line left partial by the cut
+        if not detail:
+            return message
+    return f"{message}\n```text\n{detail}\n```"
+
+
+def _run_steamcmd_blocking(cfg) -> tuple[bool, str, str]:
     """Run steamcmd, recovering where we can: transient (content-server/network)
     failures are retried with backoff; a disk-full failure triggers a one-time
     prune of configured client-only content, then a retry. Configured symlinks
-    are re-verified after any run that touched files. Returns (ok, reason);
-    reason is a short human-readable string on failure and "" on success."""
+    are re-verified after any run that touched files. Returns (ok, reason,
+    debug); on failure `reason` is a short human-readable string and `debug`
+    is the exact command, exit code, and output tail of the last attempt
+    (both "" on success)."""
     log.info("running steamcmd app_update %s", cfg.app_id)
     reason = ""
+    returncode, output, attempt = 0, "", 0
     pruned = False
     for attempt in range(1, STEAMCMD_MAX_ATTEMPTS + 1):
         returncode, output = _run_steamcmd_once(cfg)
         if returncode == 0:
             _ensure_symlinks(cfg)
-            return True, ""
+            return True, "", ""
         reason, kind = _classify_steamcmd_failure(returncode, output)
         log.error(
             "steamcmd failed (attempt %d/%d): %s",
@@ -235,7 +277,12 @@ def _run_steamcmd_blocking(cfg) -> tuple[bool, str]:
         backoff = STEAMCMD_RETRY_BACKOFF_SECONDS * attempt
         log.info("retrying steamcmd in %ds", backoff)
         time.sleep(backoff)
-    return False, reason
+    debug = (
+        f"$ {' '.join(_steamcmd_cmd(cfg))}\n"
+        f"exit code {returncode} on attempt {attempt}/{STEAMCMD_MAX_ATTEMPTS}\n"
+        f"--- steamcmd output tail ---\n{output}"
+    )
+    return False, reason, debug
 
 
 def _install_plugins_blocking(cfg, names) -> dict:
@@ -317,15 +364,16 @@ async def perform_daily_update(cfg, manager, notify) -> None:
 
     await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
     await manager.stop()
-    ok, reason = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
+    ok, reason, debug = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
     if not ok:
         # steamcmd failed; bring the server back on the old build, in
         # whatever plugin mode it was already in, and move on
         await manager.start(plugins_enabled=not state["plugins_disabled"])
         await manager.wait_healthy()
-        await notify(
-            f"⚠️ CS2 daily update failed ({reason}); server restarted on the existing build."
-        )
+        await notify(with_debug_tail(
+            f"⚠️ CS2 daily update failed ({reason}); server restarted on the existing build.",
+            debug,
+        ))
         return
 
     new_build = read_buildid(cfg)
@@ -340,15 +388,17 @@ async def perform_daily_update(cfg, manager, notify) -> None:
     healthy = await restart_with_fallback(cfg, manager, state)
 
     if not healthy:
-        await notify(
+        await notify(with_debug_tail(
             f"❌ CS2 update to build {new_build} left the server unable to start, even without plugins. "
-            "Check the logs / `/status`."
-        )
+            "Check the logs / `/status`.",
+            manager.last_failed_start_tail,
+        ))
     elif state["plugins_disabled"]:
-        await notify(
+        await notify(with_debug_tail(
             f"⚠️ CS2 updated to build {new_build}, but the plugins failed to start on it. Running "
-            "**without plugins** until a compatible release is available; recovery loop will retry hourly."
-        )
+            "**without plugins** until a compatible release is available; recovery loop will retry hourly.",
+            manager.last_failed_start_tail,
+        ))
     elif changed:
         await notify(f"✅ CS2 updated to build {new_build}; plugins refreshed, server healthy.")
 
@@ -371,15 +421,17 @@ async def perform_plugin_reinstall(cfg, manager, notify) -> bool:
     if healthy and not state["plugins_disabled"]:
         await notify("✅ Plugins reinstalled on request; server healthy.")
     elif healthy:
-        await notify(
+        await notify(with_debug_tail(
             "⚠️ Plugins reinstalled on request, but the server still won't start with them; "
-            "running **without plugins**. Check the logs / `/status`."
-        )
+            "running **without plugins**. Check the logs / `/status`.",
+            manager.last_failed_start_tail,
+        ))
     else:
-        await notify(
+        await notify(with_debug_tail(
             "❌ Plugins reinstalled on request but the server did not come up healthy, even "
-            "without plugins. Check the logs / `/status`."
-        )
+            "without plugins. Check the logs / `/status`.",
+            manager.last_failed_start_tail,
+        ))
     return healthy
 
 

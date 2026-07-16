@@ -202,15 +202,17 @@ async def restart(interaction: discord.Interaction):
     if healthy and not state["plugins_disabled"]:
         await interaction.followup.send("🔄 Server restarted and healthy.")
     elif healthy:
-        await interaction.followup.send(
+        await interaction.followup.send(updater.with_debug_tail(
             "⚠️ Server restarted but plugins wouldn't start; running **without plugins**. "
-            "Check the logs / `/status`."
-        )
+            "Check the logs / `/status`.",
+            bot.manager.last_failed_start_tail,
+        ))
     else:
-        await interaction.followup.send(
+        await interaction.followup.send(updater.with_debug_tail(
             "⚠️ Server was restarted but did not report healthy within the timeout, even "
-            "without plugins. Check the logs / `/status`."
-        )
+            "without plugins. Check the logs / `/status`.",
+            bot.manager.last_failed_start_tail,
+        ))
 
 
 @bot.tree.command(name="map", description="Change the map (admin)")
@@ -258,10 +260,11 @@ async def reinstall_plugins(interaction: discord.Interaction):
     if healthy:
         await interaction.followup.send("🧩 Plugins reinstalled; server healthy.")
     else:
-        await interaction.followup.send(
+        await interaction.followup.send(updater.with_debug_tail(
             "⚠️ Plugins reinstalled but the server did not report healthy within the timeout. "
-            "Check the logs / `/status`."
-        )
+            "Check the logs / `/status`.",
+            bot.manager.last_failed_start_tail,
+        ))
 
 
 @bot.tree.command(name="status", description="Show server status (admin)")

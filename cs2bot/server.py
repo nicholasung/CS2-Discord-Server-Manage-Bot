@@ -52,6 +52,11 @@ class ServerManager:
         self._seen_markers: set[str] = set()
         self._lock = asyncio.Lock()
         self._plugins_enabled = True
+        # Console tail captured the last time wait_healthy() failed. The
+        # buffer itself is reset on every start(), so this is the only place
+        # a failed attempt's output survives the fallback restart that
+        # follows it -- status notifications attach it as debug detail.
+        self.last_failed_start_tail = ""
 
     @property
     def is_running(self) -> bool:
@@ -93,7 +98,7 @@ class ServerManager:
         # floods the loop with synchronous write syscalls and starves
         # Discord interaction handlers of their 3s ACK window (commands
         # time out). Lines are still retained in the ring buffer above
-        # and surfaced via _log_tail() on failure.
+        # and surfaced via _record_failed_start() on failure.
         log.debug("[GAME] %s", line)
         for marker in self.cfg.startup_markers:
             if marker in line:
@@ -310,7 +315,7 @@ class ServerManager:
         while loop.time() < deadline:
             if not self.is_running:
                 log.error("server process exited during startup")
-                self._log_tail()
+                self._record_failed_start("server process exited during startup")
                 return False
             if self._seen_markers.issuperset(markers):
                 log.info("all startup markers seen; server healthy")
@@ -318,7 +323,7 @@ class ServerManager:
             await asyncio.sleep(2)
         missing = set(markers) - self._seen_markers
         log.error("timed out waiting for startup markers: %s", sorted(missing))
-        self._log_tail()
+        self._record_failed_start(f"timed out; missing startup markers: {sorted(missing)}")
         return False
 
     async def restart(self, plugins_enabled: bool = True) -> bool:
@@ -327,7 +332,12 @@ class ServerManager:
         await self.start(plugins_enabled=plugins_enabled)
         return await self.wait_healthy()
 
-    def _log_tail(self, n: int = 25):
-        tail = list(self._buffer)[-n:]
+    def log_tail(self, n: int = 25) -> str:
+        """Last n captured server console lines, newest last, as one string."""
+        return "\n".join(list(self._buffer)[-n:])
+
+    def _record_failed_start(self, why: str):
+        tail = self.log_tail()
+        self.last_failed_start_tail = f"{why}\n--- server console tail ---\n{tail}" if tail else why
         if tail:
-            log.error("last %d server log lines:\n%s", len(tail), "\n".join(tail))
+            log.error("last server log lines:\n%s", tail)
