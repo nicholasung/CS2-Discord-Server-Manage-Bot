@@ -355,14 +355,21 @@ async def restart_with_fallback(cfg, manager, state: dict | None = None) -> bool
     return healthy
 
 
-async def perform_daily_update(cfg, manager, notify) -> None:
+async def perform_daily_update(cfg, manager, notify, manual: bool = False) -> None:
     """Stop server, run steamcmd, and if CS2 changed (or we're recovering
     from a broken state) update plugins, then start and verify -- falling
-    back to a no-plugin launch if the update broke plugin compatibility."""
+    back to a no-plugin launch if the update broke plugin compatibility.
+
+    manual=True (the /update admin command) skips the wait-for-empty
+    deferral -- like the other manual admin commands, the invoking admin
+    has already decided the disruption is warranted -- and also reports
+    the no-new-build outcome, which the scheduled daily run keeps silent
+    to avoid a pointless notification every day."""
     state = load_state(cfg)
     old_build = read_buildid(cfg)
 
-    await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
+    if not manual:
+        await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
     await manager.stop()
     ok, reason, debug = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
     if not ok:
@@ -401,6 +408,10 @@ async def perform_daily_update(cfg, manager, notify) -> None:
         ))
     elif changed:
         await notify(f"✅ CS2 updated to build {new_build}; plugins refreshed, server healthy.")
+    elif manual:
+        await notify(
+            f"✅ No new CS2 build (still `{new_build or 'unknown'}`); server restarted, healthy."
+        )
 
 
 async def perform_plugin_reinstall(cfg, manager, notify) -> bool:

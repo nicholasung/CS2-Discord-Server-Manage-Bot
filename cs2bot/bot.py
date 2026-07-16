@@ -3,7 +3,8 @@
 One process does everything:
   * launches/supervises the CS2 server as a child (see ServerManager)
   * serves role-gated slash commands
-      Admin role: /join, /restart, /map, /gamemode, /reinstall-plugins, /status
+      Admin role: /join, /restart, /map, /gamemode, /update,
+                  /reinstall-plugins, /status
       User role:  recognized, but has no commands yet — add them under the
                   user_only() check when the time comes.
   * runs the daily steamcmd update and the hourly plugin-recovery loops
@@ -29,6 +30,13 @@ from .server import ServerManager
 
 log = logging.getLogger("cs2bot")
 cfg = load_config()
+
+# Serializes the flows that mutate game files between a stop and a start
+# (the daily update and recovery loops, /update, /reinstall-plugins). The
+# ServerManager lock only covers the process itself; without this, a manual
+# update colliding with a scheduled one would interleave steamcmd and plugin
+# writes between each other's stop/start.
+_update_lock = asyncio.Lock()
 
 
 def _has_any_role(member, wanted: list) -> bool:
@@ -250,13 +258,55 @@ async def gamemode(interaction: discord.Interaction, mode: str, map: str = ""):
 
 
 @bot.tree.command(
+    name="update",
+    description="Check for a CS2 update now and apply it — restarts the server (admin)",
+)
+@admin_only()
+async def force_update(interaction: discord.Interaction):
+    if _update_lock.locked():
+        await interaction.response.send_message(
+            "⏳ An update or reinstall is already in progress; watch the status channel.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        "🔄 Checking for a CS2 update now — the server restarts on whatever build "
+        "comes out of it. Progress is posted to the status channel.",
+        ephemeral=True,
+    )
+    # Relay the updater's notifications while keeping the last one -- the
+    # outcome -- to echo back to the invoking admin, who otherwise gets no
+    # feedback at all when no status channel is configured.
+    outcome: list[str] = []
+
+    async def relay(message: str):
+        outcome.append(message)
+        await notify(message)
+
+    async with _update_lock:
+        await updater.perform_daily_update(cfg, bot.manager, relay, manual=True)
+    if outcome:
+        try:
+            await interaction.followup.send(outcome[-1], ephemeral=True)
+        except discord.DiscordException:
+            pass  # token expires after 15 min; a slow download can outlive it
+
+
+@bot.tree.command(
     name="reinstall-plugins",
     description="Force-reinstall Metamod/CSSharp/MatchZy and restart (admin)",
 )
 @admin_only()
 async def reinstall_plugins(interaction: discord.Interaction):
+    if _update_lock.locked():
+        await interaction.response.send_message(
+            "⏳ An update is already in progress; try again once it finishes.",
+            ephemeral=True,
+        )
+        return
     await interaction.response.defer(ephemeral=True)
-    healthy = await updater.perform_plugin_reinstall(cfg, bot.manager, notify)
+    async with _update_lock:
+        healthy = await updater.perform_plugin_reinstall(cfg, bot.manager, notify)
     if healthy:
         await interaction.followup.send("🧩 Plugins reinstalled; server healthy.")
     else:
@@ -296,7 +346,8 @@ _LOCAL_TZ = dt.datetime.now().astimezone().tzinfo
 @tasks.loop(time=dt.time(hour=cfg.daily_hour, minute=cfg.daily_minute, tzinfo=_LOCAL_TZ))
 async def daily_update_loop():
     try:
-        await updater.perform_daily_update(cfg, bot.manager, notify)
+        async with _update_lock:
+            await updater.perform_daily_update(cfg, bot.manager, notify)
     except Exception:
         log.exception("daily update loop failed")
 
@@ -304,7 +355,8 @@ async def daily_update_loop():
 @tasks.loop(hours=cfg.recovery_interval_hours)
 async def recovery_loop():
     try:
-        await updater.perform_recovery(cfg, bot.manager, notify)
+        async with _update_lock:
+            await updater.perform_recovery(cfg, bot.manager, notify)
     except Exception:
         log.exception("recovery loop failed")
 
