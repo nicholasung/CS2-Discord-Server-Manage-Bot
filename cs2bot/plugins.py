@@ -21,6 +21,20 @@ MATCHZY_REPO = "shobhit-pathak/MatchZy"
 
 PLUGINS = ("metamod", "cssharp", "matchzy")
 
+# Operator-edited files that plugin release zips also ship as templates
+# (paths relative to game/csgo, as stored in the zips). Once one of these
+# exists on disk it is never overwritten by a plugin (re)install -- daily
+# updates and recovery reinstalls would otherwise reset admin lists to the
+# upstream template. A first install still extracts the template, since
+# nothing exists yet. Add more paths here to protect other local edits.
+PRESERVED_CONFIGS = frozenset({
+    "addons/counterstrikesharp/configs/admins.json",
+    "addons/counterstrikesharp/configs/admin_groups.json",
+    "addons/counterstrikesharp/configs/core.json",
+    "cfg/MatchZy/admins.json",
+    "cfg/MatchZy/whitelist.cfg",
+})
+
 
 def _http_get(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "cs2bot-updater"})
@@ -56,7 +70,14 @@ def latest_versions() -> dict:
 
 def _extract_zip(data: bytes, dest: Path):
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        zf.extractall(dest)
+        members = []
+        for info in zf.infolist():
+            name = os.path.normpath(info.filename)
+            if name in PRESERVED_CONFIGS and (dest / name).exists():
+                log.info("keeping existing %s (local edits preserved)", name)
+                continue
+            members.append(info)
+        zf.extractall(dest, members=members)
         # zipfile drops unix permissions; restore them (dotnet/.so need +x).
         # Always OR in owner rwx/rw on top of whatever the archive stored:
         # some release zips carry restrictive or missing unix attrs for
@@ -65,11 +86,33 @@ def _extract_zip(data: bytes, dest: Path):
         # can lock the extracting/running user out of its own install -- and
         # since plugins get reinstalled on every recovery attempt, that would
         # keep re-clobbering any manual permission fix on the next retry.
-        for info in zf.infolist():
+        for info in members:
             path = dest / info.filename
             mode = info.external_attr >> 16
             owner_bits = 0o700 if info.is_dir() else 0o600
             os.chmod(path, mode | owner_bits)
+
+
+def extract_tar(tf: tarfile.TarFile, dest: Path):
+    """extractall with the same guarantees _extract_zip enforces for zips:
+    the extracting user always keeps rw(x) on what it extracted, and
+    ownership is never taken from the archive -- an unfiltered extractall
+    running as root (easy to hit on a first-run bootstrap) chowns files to
+    whatever uids the upstream build machine stored, leaving them unwritable
+    by the bot's own user on the next update. The stdlib 'data' filter
+    (3.12+, and the PEP 706 backports to 3.8.17/3.9.17/3.10.12/3.11.4) does
+    both; older pythons get a manual mode fix-up instead."""
+    if hasattr(tarfile, "data_filter"):
+        tf.extractall(dest, filter="data")
+        return
+    tf.extractall(dest)
+    for m in tf.getmembers():
+        if not (m.isfile() or m.isdir()):
+            continue
+        try:
+            os.chmod(dest / m.name, m.mode | (0o700 if m.isdir() else 0o600))
+        except OSError:
+            pass
 
 
 def install(name: str, csgo_dir: Path) -> str:
@@ -79,7 +122,7 @@ def install(name: str, csgo_dir: Path) -> str:
         log.info("installing metamod %s", filename)
         data = _http_get(MMS_BASE + filename)
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-            tf.extractall(csgo_dir)
+            extract_tar(tf, csgo_dir)
         return filename
 
     repo, pick = {

@@ -50,7 +50,7 @@ def install_steamcmd(cfg) -> str:
     log.info("downloading steamcmd to %s", dest)
     with urllib.request.urlopen(STEAMCMD_LINUX_URL, timeout=120) as resp:
         with tarfile.open(fileobj=resp, mode="r|gz") as tf:
-            tf.extractall(dest)
+            plugins.extract_tar(tf, dest)
     script = dest / "steamcmd.sh"
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
     log.info("steamcmd installed at %s", script)
@@ -92,6 +92,10 @@ def ensure_launch_script(cfg) -> None:
         return
     cs2_bin = cfg.csgo_dir.parent / "bin" / "linuxsteamrt64" / "cs2"
     script.parent.mkdir(parents=True, exist_ok=True)
+    # The rcon password is templated into this file, so it must be owner-only
+    # from the moment it exists -- create it closed rather than letting
+    # write_text's default (world-readable) apply first.
+    script.touch(mode=0o600)
     script.write_text(
         _DEFAULT_LAUNCH_SCRIPT.format(
             launch_script=script,
@@ -102,7 +106,7 @@ def ensure_launch_script(cfg) -> None:
         ),
         encoding="utf-8",
     )
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    script.chmod(0o700)
     log.warning(
         "wrote a bare-bones launch script at %s -- review it (GSLT token, "
         "hostname, workshop maps, etc.) before relying on it long-term",
