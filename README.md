@@ -194,4 +194,4 @@ sudo scripts/fix_ownership.sh <service-user>   # e.g. niccs2; reads paths from c
 sudo systemctl start cs2bot
 ```
 
-The script re-owns everything the stack touches (Steam library, install dir, bot dir/venv, state dir, steamcmd and its `~/.steam` state) to the service user with least-privilege modes: owner-only `u=rwX,go=` everywhere, `0600` on `config.json` and `0700` on the launch script since both carry passwords, and guarantees the `cs2`/`steamcmd.sh` executables stay executable.
+The script re-owns everything the stack touches (Steam library, install dir, bot dir/venv, state dir, steamcmd and its state in `~/.steam` and `~/.local/share/Steam/steamcmd`) to the service user with least-privilege modes: owner-only `u=rwX,go=` everywhere, `0600` on `config.json` and `0700` on the launch script since both carry passwords, and guarantees the `cs2`/`steamcmd.sh` executables stay executable.

@@ -67,7 +67,9 @@ PY
 )
 [[ ${#entries[@]} -gt 0 ]] || die "could not read paths from $cfg"
 
-dirs=("$home/.steam")  # steamcmd's own state; unwritable here = exit 254
+# steamcmd's own state, unwritable here = exit 254. Debian's wrapper keeps
+# the real binaries/state under the XDG path, not just ~/.steam.
+dirs=("$home/.steam" "$home/.local/share/Steam/steamcmd")
 files0600=() files0700=() execs=()
 for e in "${entries[@]}"; do
     kind=${e%%|*} path=${e#*|}
