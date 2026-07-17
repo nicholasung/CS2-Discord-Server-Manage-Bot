@@ -69,21 +69,22 @@ _DISK_FULL_RE = re.compile(
 )
 
 
-def _steamcmd_cmd(cfg) -> list[str]:
+def _steamcmd_cmd(cfg, validate: bool = False) -> list[str]:
+    app_update = [str(cfg.app_id), "validate"] if validate else [str(cfg.app_id)]
     return [
         cfg.steamcmd,
         "+force_install_dir", str(cfg.steam_library),
         "+login", "anonymous",
-        "+app_update", str(cfg.app_id),
+        "+app_update", *app_update,
         "+quit",
     ]
 
 
-def _run_steamcmd_once(cfg) -> tuple[int, str]:
+def _run_steamcmd_once(cfg, validate: bool = False) -> tuple[int, str]:
     """One steamcmd invocation. Relays output live to stdout (-> journald, as
     before) while retaining the tail so a failure's real reason can be
     classified. Returns (returncode, tail_text)."""
-    cmd = _steamcmd_cmd(cfg)
+    cmd = _steamcmd_cmd(cfg, validate)
     tail: collections.deque = collections.deque(maxlen=40)
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
@@ -98,13 +99,29 @@ def _run_steamcmd_once(cfg) -> tuple[int, str]:
     return proc.returncode, "\n".join(tail)
 
 
+# steamcmd reports the app's manifest state on failure ("state is 0x626").
+# The 0x20 bit means Files Missing: an update started, was interrupted before
+# committing, and the manifest now records files as gone -- retrying a plain
+# app_update can't repair that; clearing the half-applied download and
+# re-running with `validate` can.
+_APP_STATE_RE = re.compile(r"state is (0x[0-9a-fA-F]+)")
+_STATE_FILES_MISSING = 0x20
+
+
 def _classify_steamcmd_failure(returncode: int, output: str) -> tuple[str, str]:
     """Map a failed run to (human_reason, kind). kind drives what happens next:
     'disk_full' -> prune configured client-only content and retry (retrying
-    alone won't help); 'content_servers' / 'other' -> transient, retry with
-    backoff."""
+    alone won't help); 'files_missing' -> clear steamcmd's interrupted-download
+    leftovers and retry once with validate; 'content_servers' / 'other' ->
+    transient, retry with backoff."""
     if _DISK_FULL_RE.search(output):
         return "not enough disk space on the install volume", "disk_full"
+    state = _APP_STATE_RE.search(output)
+    if state and int(state.group(1), 16) & _STATE_FILES_MISSING:
+        return (
+            f"install is missing files (app state {state.group(1)}; interrupted update)",
+            "files_missing",
+        )
     if "0x202" in output:
         return "Steam content servers unavailable (update aborted, state 0x202)", "content_servers"
     if returncode == 254 or "needs to be online" in output.lower():
@@ -127,6 +144,18 @@ def _classify_steamcmd_failure(returncode: int, output: str) -> tuple[str, str]:
 _STEAMCMD_SCRATCH = ("steamapps/downloading", "steamapps/temp")
 
 
+def _clear_scratch(cfg) -> None:
+    """Remove steamcmd's partial-download/staging leftovers. Never installed
+    game content and regenerated on demand, so always safe; the first repair
+    step when steamcmd reports the install is missing files (a half-applied
+    update sitting in steamapps/downloading is the usual cause)."""
+    for rel in _STEAMCMD_SCRATCH:
+        path = cfg.steam_library / rel
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+            log.info("cleared steamcmd scratch %s", path)
+
+
 def _path_size(path: Path) -> int:
     """Bytes used by a file or (recursively) a directory, not following
     symlinks."""
@@ -147,8 +176,9 @@ def _free_disk_space(cfg) -> int:
     steamcmd's scratch/staging dirs first (safe leftovers from interrupted
     runs, under the Steam library root), then deletes any configured
     prune_paths -- client-only content a dedicated server doesn't need, under
-    the game dir. A plain app_update won't re-download pruned content (only a
-    `validate` would, which the bot never runs), so the space stays freed.
+    the game dir. A plain app_update won't re-download pruned content, so the
+    space stays freed (a `validate` would re-fetch it, which the bot runs only
+    as the one-time files-missing repair in _run_steamcmd_blocking).
     Safety rails: never removes a symlink (would drop custom-content links),
     never a path listed in `symlinks`, and never anything outside the library
     root. Returns bytes freed."""
@@ -241,17 +271,20 @@ def with_debug_tail(message: str, detail: str) -> str:
 def _run_steamcmd_blocking(cfg) -> tuple[bool, str, str]:
     """Run steamcmd, recovering where we can: transient (content-server/network)
     failures are retried with backoff; a disk-full failure triggers a one-time
-    prune of configured client-only content, then a retry. Configured symlinks
-    are re-verified after any run that touched files. Returns (ok, reason,
-    debug); on failure `reason` is a short human-readable string and `debug`
-    is the exact command, exit code, and output tail of the last attempt
-    (both "" on success)."""
+    prune of configured client-only content, then a retry; a files-missing app
+    state (interrupted update, e.g. 0x626) triggers a one-time scratch cleanup
+    and a retry with `validate` so steamcmd re-verifies the whole install.
+    Configured symlinks are re-verified after any run that touched files.
+    Returns (ok, reason, debug); on failure `reason` is a short human-readable
+    string and `debug` is the exact command, exit code, and output tail of the
+    last attempt (both "" on success)."""
     log.info("running steamcmd app_update %s", cfg.app_id)
     reason = ""
     returncode, output, attempt = 0, "", 0
     pruned = False
+    validate = False
     for attempt in range(1, STEAMCMD_MAX_ATTEMPTS + 1):
-        returncode, output = _run_steamcmd_once(cfg)
+        returncode, output = _run_steamcmd_once(cfg, validate=validate)
         if returncode == 0:
             _ensure_symlinks(cfg)
             return True, "", ""
@@ -260,6 +293,12 @@ def _run_steamcmd_blocking(cfg) -> tuple[bool, str, str]:
             "steamcmd failed (attempt %d/%d): %s",
             attempt, STEAMCMD_MAX_ATTEMPTS, reason,
         )
+
+        if kind == "files_missing" and not validate:
+            validate = True
+            _clear_scratch(cfg)
+            log.info("cleared download leftovers; retrying with validate to repair the install")
+            continue  # retry now; validate re-fetches whatever is missing
 
         if kind == "disk_full" and not pruned:
             pruned = True
@@ -278,7 +317,7 @@ def _run_steamcmd_blocking(cfg) -> tuple[bool, str, str]:
         log.info("retrying steamcmd in %ds", backoff)
         time.sleep(backoff)
     debug = (
-        f"$ {' '.join(_steamcmd_cmd(cfg))}\n"
+        f"$ {' '.join(_steamcmd_cmd(cfg, validate))}\n"
         f"exit code {returncode} on attempt {attempt}/{STEAMCMD_MAX_ATTEMPTS}\n"
         f"--- steamcmd output tail ---\n{output}"
     )

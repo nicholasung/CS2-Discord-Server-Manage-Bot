@@ -132,6 +132,7 @@ daily HH:MM  players online? → defer (recheck every player_check_interval_seco
              ├─ steamcmd failed → classify:
              │    ├─ transient (content servers / 0x202) → retry w/ backoff (up to 3x)
              │    ├─ disk full → clear steamcmd scratch (+ prune_paths), retry once
+             │    ├─ files missing (interrupted update, e.g. 0x626) → clear scratch, retry once with validate
              │    └─ still failing → restart on old build (same plugin mode), notify ⚠️ with reason
              └─ ok → buildid changed (or was broken)?
                       ├─ no  → just start server back up
@@ -152,7 +153,7 @@ hourly       not broken → no-op
 
 Plugin sources: Metamod:Source dev builds from `mms.alliedmods.net`, CounterStrikeSharp (`with-runtime` linux build) and MatchZy from their GitHub latest releases.
 
-> Plugin archives are extracted over the existing install, refreshing plugin binaries but leaving files that only exist locally (e.g. your `admins.json`, MatchZy config edits) in place unless the release ships the same file.
+> Plugin archives are extracted over the existing install, refreshing plugin binaries but leaving files that only exist locally in place. Operator-edited files that the releases *also* ship as templates — CSSharp's `admins.json`/`admin_groups.json`/`core.json`, MatchZy's `admins.json`/`whitelist.cfg` — are never overwritten once they exist on disk (see `PRESERVED_CONFIGS` in [cs2bot/plugins.py](cs2bot/plugins.py) to protect more).
 
 ## Disk-full recovery
 
@@ -179,4 +180,18 @@ When `steamcmd` aborts an update for lack of space (it reports `Error! App '730'
 - **Safety rails:** pruning never removes a symlink, never removes a path listed in `symlinks`, and never touches anything outside `install_dir`. If nothing can be freed, the update just fails cleanly onto the old build — it won't loop.
 - `symlinks` you've linked *into* the install dir (custom maps/cfgs) are re-created after every update or prune, so they self-heal if anything removes them.
 
-> **Why the freed space stays freed:** the bot only ever runs a plain `app_update`, which trusts the local manifest and won't re-download files you deleted. Do **not** run `steamcmd +app_update 730 validate` against this install — a `validate` re-hashes everything and pulls the pruned content back, refilling the disk.
+> **Why the freed space stays freed:** the bot normally runs a plain `app_update`, which trusts the local manifest and won't re-download files you deleted. Avoid running `steamcmd +app_update 730 validate` against this install by hand — a `validate` re-hashes everything and pulls the pruned content back, refilling the disk. The one exception is the bot's own interrupted-update repair below, which accepts that trade-off to get a broken install working again.
+
+## Interrupted-update repair (files missing, e.g. state 0x626)
+
+If a steamcmd run dies partway through an update (reboot, kill, crash), the app manifest can be left recording missing files — later runs then fail with `Error! App '730' state is 0x626` (any state with the `0x20` *files missing* bit set). Retrying a plain `app_update` can't repair this, so when the bot sees it, it clears steamcmd's half-applied download leftovers (`steamapps/downloading`, `steamapps/temp`) and re-runs **once with `validate`**, which re-verifies the whole install and re-fetches whatever is actually missing. Note this also re-downloads anything you removed via `prune_paths`; if that refills the disk, the normal disk-full recovery takes over on the next attempt.
+
+If the failure is instead about *permissions* — files owned by root or another user because steamcmd/the bootstrap once ran under `sudo`, typically surfacing as steamcmd exit 254 (unwritable steamcmd state dir) or update jobs aborting partway — repair ownership with:
+
+```bash
+sudo systemctl stop cs2bot
+sudo scripts/fix_ownership.sh <service-user>   # e.g. niccs2; reads paths from config.json
+sudo systemctl start cs2bot
+```
+
+The script re-owns everything the stack touches (Steam library, install dir, bot dir/venv, state dir, steamcmd and its `~/.steam` state) to the service user with least-privilege modes: owner-only `u=rwX,go=` everywhere, `0600` on `config.json` and `0700` on the launch script since both carry passwords, and guarantees the `cs2`/`steamcmd.sh` executables stay executable.

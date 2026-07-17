@@ -89,8 +89,10 @@ class Config:
         # extra paths (globs, relative to install_dir) before retrying once.
         # Meant for client-only content a dedicated server doesn't need; a
         # plain app_update won't re-download them (only a `validate` would,
-        # which the bot never runs). Symlinks and anything in `symlinks` are
-        # never touched. Empty (default) = scratch cleanup only.
+        # which the bot runs solely to repair a files-missing install state,
+        # re-fetching pruned content as a side effect). Symlinks and anything
+        # in `symlinks` are never touched. Empty (default) = scratch cleanup
+        # only.
         self.prune_paths = [str(p) for p in u.get("prune_paths", [])]
         # Custom-content symlinks to (re)create after any update/prune, so
         # maps/cfgs linked into the install dir survive. Each entry is
