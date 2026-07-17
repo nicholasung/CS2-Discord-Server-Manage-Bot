@@ -268,21 +268,22 @@ def with_debug_tail(message: str, detail: str) -> str:
     return f"{message}\n```text\n{detail}\n```"
 
 
-def _run_steamcmd_blocking(cfg) -> tuple[bool, str, str]:
+def _run_steamcmd_blocking(cfg, validate: bool = False) -> tuple[bool, str, str]:
     """Run steamcmd, recovering where we can: transient (content-server/network)
     failures are retried with backoff; a disk-full failure triggers a one-time
     prune of configured client-only content, then a retry; a files-missing app
     state (interrupted update, e.g. 0x626) triggers a one-time scratch cleanup
     and a retry with `validate` so steamcmd re-verifies the whole install.
+    validate=True (the /validate admin command) forces that verify/repair pass
+    from the first attempt instead of waiting for a files-missing failure.
     Configured symlinks are re-verified after any run that touched files.
     Returns (ok, reason, debug); on failure `reason` is a short human-readable
     string and `debug` is the exact command, exit code, and output tail of the
     last attempt (both "" on success)."""
-    log.info("running steamcmd app_update %s", cfg.app_id)
+    log.info("running steamcmd app_update %s%s", cfg.app_id, " validate" if validate else "")
     reason = ""
     returncode, output, attempt = 0, "", 0
     pruned = False
-    validate = False
     for attempt in range(1, STEAMCMD_MAX_ATTEMPTS + 1):
         returncode, output = _run_steamcmd_once(cfg, validate=validate)
         if returncode == 0:
@@ -340,23 +341,47 @@ def _install_plugins_blocking(cfg, names) -> dict:
 
 # ---------- orchestration (async, called by bot loops) ----------
 
+# Consecutive failed player-count checks tolerated before the empty-server
+# wait gives up and proceeds. A busy server or a map change can make a single
+# RCON `status` time out; one hiccup must not defeat the guard right after it
+# announced it was waiting for the server to empty.
+_PLAYER_CHECK_MAX_FAILURES = 3
+
+
 async def _wait_for_empty_server(cfg, manager, notify, action: str) -> None:
     """Block until no human players are connected before an automatic
     action that would disconnect them (stopping/restarting the server for
     an update). A no-op if the server isn't currently running -- nothing
-    to disturb -- and gives up and proceeds anyway if the player count
-    can't be determined (RCON down, etc.), rather than blocking forever on
-    a check that may never succeed."""
+    to disturb. Only gives up and proceeds if the player count can't be
+    determined _PLAYER_CHECK_MAX_FAILURES times in a row (RCON down for
+    good, etc.), rather than blocking forever on a check that may never
+    succeed -- and posts a notice if it had already announced it was
+    deferring, so the wait never silently contradicts itself."""
     if not manager.is_running:
         return
 
     deferred = False
+    failures = 0
     while True:
         try:
             count = await asyncio.to_thread(rcon.player_count, cfg)
         except Exception as e:
-            log.warning("could not check player count (%s); proceeding with %s", e, action)
+            failures += 1
+            if failures < _PLAYER_CHECK_MAX_FAILURES:
+                log.warning("player-count check failed (%d/%d): %s; retrying in %ds",
+                            failures, _PLAYER_CHECK_MAX_FAILURES, e,
+                            cfg.player_check_interval_seconds)
+                await asyncio.sleep(cfg.player_check_interval_seconds)
+                continue
+            log.warning("could not check player count %d times in a row (%s); "
+                        "proceeding with %s", failures, e, action)
+            if deferred:
+                await notify(
+                    f"⚠️ Can no longer check the player count ({e}); "
+                    f"proceeding with {action} anyway."
+                )
             return
+        failures = 0
         if count == 0:
             if deferred:
                 log.info("server empty; proceeding with %s", action)
@@ -394,7 +419,8 @@ async def restart_with_fallback(cfg, manager, state: dict | None = None) -> bool
     return healthy
 
 
-async def perform_daily_update(cfg, manager, notify, manual: bool = False) -> None:
+async def perform_daily_update(cfg, manager, notify, manual: bool = False,
+                               validate: bool = False) -> None:
     """Wait for the server to empty, stop it, run steamcmd, and if CS2
     changed (or we're recovering from a broken state) update plugins, then
     start and verify -- falling back to a no-plugin launch if the update
@@ -402,11 +428,16 @@ async def perform_daily_update(cfg, manager, notify, manual: bool = False) -> No
     steamcmd touches the install, so no game files are open/in use while it
     rewrites them.
 
-    manual=True (the /update admin command) additionally reports the
-    no-new-build outcome, which the scheduled daily run keeps silent to
-    avoid a pointless notification every day. The empty-server wait applies
-    either way -- a manual update still defers until players disconnect
-    rather than kicking them off mid-game."""
+    manual=True (the /update and /validate admin commands) additionally
+    reports the no-new-build outcome, which the scheduled daily run keeps
+    silent to avoid a pointless notification every day. The empty-server
+    wait applies either way -- a manual update still defers until players
+    disconnect rather than kicking them off mid-game.
+
+    validate=True (the /validate admin command) forces steamcmd's full
+    verify/repair pass -- every file re-hashed against the depot, anything
+    damaged or missing re-fetched. Slow, and it re-downloads pruned content;
+    the on-demand repair for an install the automatic recovery couldn't fix."""
     state = load_state(cfg)
     old_build = read_buildid(cfg)
 
@@ -416,14 +447,15 @@ async def perform_daily_update(cfg, manager, notify, manual: bool = False) -> No
     # admin-triggered update still won't disconnect players mid-game.
     await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
     await manager.stop()
-    ok, reason, debug = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
+    ok, reason, debug = await asyncio.to_thread(_run_steamcmd_blocking, cfg, validate)
     if not ok:
         # steamcmd failed; bring the server back on the old build, in
         # whatever plugin mode it was already in, and move on
+        action = "install validation" if validate else "daily update"
         await manager.start(plugins_enabled=not state["plugins_disabled"])
         await manager.wait_healthy()
         await notify(with_debug_tail(
-            f"⚠️ CS2 daily update failed ({reason}); server restarted on the existing build.",
+            f"⚠️ CS2 {action} failed ({reason}); server restarted on the existing build.",
             debug,
         ))
         return
@@ -454,8 +486,9 @@ async def perform_daily_update(cfg, manager, notify, manual: bool = False) -> No
     elif changed:
         await notify(f"✅ CS2 updated to build {new_build}; plugins refreshed, server healthy.")
     elif manual:
+        checked = "Install validated; no" if validate else "No"
         await notify(
-            f"✅ No new CS2 build (still `{new_build or 'unknown'}`); server restarted, healthy."
+            f"✅ {checked} new CS2 build (still `{new_build or 'unknown'}`); server restarted, healthy."
         )
 
 
