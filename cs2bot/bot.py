@@ -270,8 +270,9 @@ async def force_update(interaction: discord.Interaction):
         )
         return
     await interaction.response.send_message(
-        "🔄 Checking for a CS2 update now — the server restarts on whatever build "
-        "comes out of it. Progress is posted to the status channel.",
+        "🔄 Checking for a CS2 update now. If players are online I'll wait for the "
+        "server to empty first, then take it down, update, and restart. Progress is "
+        "posted to the status channel.",
         ephemeral=True,
     )
     # Relay the updater's notifications while keeping the last one -- the
@@ -304,17 +305,28 @@ async def reinstall_plugins(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-    await interaction.response.defer(ephemeral=True)
+    # Respond right away rather than deferring: with the empty-server wait this
+    # can run long past the interaction's deferral window if players are on.
+    await interaction.response.send_message(
+        "🧩 Reinstalling plugins. If players are online I'll wait for the server to "
+        "empty first, then take it down, reinstall, and restart. Progress is posted "
+        "to the status channel.",
+        ephemeral=True,
+    )
     async with _update_lock:
         healthy = await updater.perform_plugin_reinstall(cfg, bot.manager, notify)
     if healthy:
-        await interaction.followup.send("🧩 Plugins reinstalled; server healthy.")
+        msg = "🧩 Plugins reinstalled; server healthy."
     else:
-        await interaction.followup.send(updater.with_debug_tail(
+        msg = updater.with_debug_tail(
             "⚠️ Plugins reinstalled but the server did not report healthy within the timeout. "
             "Check the logs / `/status`.",
             bot.manager.last_failed_start_tail,
-        ))
+        )
+    try:
+        await interaction.followup.send(msg, ephemeral=True)
+    except discord.DiscordException:
+        pass  # token may have expired during a long player-wait; notify() already posted the outcome
 
 
 @bot.tree.command(name="status", description="Show server status (admin)")

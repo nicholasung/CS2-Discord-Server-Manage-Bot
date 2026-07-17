@@ -395,20 +395,26 @@ async def restart_with_fallback(cfg, manager, state: dict | None = None) -> bool
 
 
 async def perform_daily_update(cfg, manager, notify, manual: bool = False) -> None:
-    """Stop server, run steamcmd, and if CS2 changed (or we're recovering
-    from a broken state) update plugins, then start and verify -- falling
-    back to a no-plugin launch if the update broke plugin compatibility.
+    """Wait for the server to empty, stop it, run steamcmd, and if CS2
+    changed (or we're recovering from a broken state) update plugins, then
+    start and verify -- falling back to a no-plugin launch if the update
+    broke plugin compatibility. The server is always fully stopped before
+    steamcmd touches the install, so no game files are open/in use while it
+    rewrites them.
 
-    manual=True (the /update admin command) skips the wait-for-empty
-    deferral -- like the other manual admin commands, the invoking admin
-    has already decided the disruption is warranted -- and also reports
-    the no-new-build outcome, which the scheduled daily run keeps silent
-    to avoid a pointless notification every day."""
+    manual=True (the /update admin command) additionally reports the
+    no-new-build outcome, which the scheduled daily run keeps silent to
+    avoid a pointless notification every day. The empty-server wait applies
+    either way -- a manual update still defers until players disconnect
+    rather than kicking them off mid-game."""
     state = load_state(cfg)
     old_build = read_buildid(cfg)
 
-    if not manual:
-        await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
+    # Wait for the server to empty (a no-op if it's already down), then take
+    # it fully down before steamcmd runs so the game files aren't in use while
+    # it rewrites them. The wait applies to a manual /update too, so an
+    # admin-triggered update still won't disconnect players mid-game.
+    await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
     await manager.stop()
     ok, reason, debug = await asyncio.to_thread(_run_steamcmd_blocking, cfg)
     if not ok:
@@ -459,9 +465,14 @@ async def perform_plugin_reinstall(cfg, manager, notify) -> bool:
     come up healthy). Unlike perform_recovery (which only acts when a newer
     upstream release exists), this always re-extracts the current release --
     the way to unstick a bad or partial install without waiting for upstream
-    to publish something new. Returns the health result of the restart."""
+    to publish something new. Waits for the server to empty before taking it
+    down, so it won't disconnect players mid-game. Returns the health result
+    of the restart."""
     state = load_state(cfg)
 
+    # Don't disconnect players mid-game, and take the server fully down before
+    # extracting over addons/ so none of those plugin files are in use.
+    await _wait_for_empty_server(cfg, manager, notify, "the plugin reinstall")
     await manager.stop()
     installed = await asyncio.to_thread(_install_plugins_blocking, cfg, plugins.PLUGINS)
     state["installed"].update(installed)
@@ -486,10 +497,11 @@ async def perform_plugin_reinstall(cfg, manager, notify) -> bool:
 
 
 async def perform_recovery(cfg, manager, notify) -> None:
-    """Hourly: only acts when the server is flagged broken. Installs any
-    plugin release newer than what's recorded, then restarts and verifies.
-    If that still isn't healthy, stays in (or drops into) the no-plugin
-    fallback and waits for the next hour's release check."""
+    """Hourly: only acts when the server is flagged broken. Waits for the
+    server to empty (it may be up in the no-plugin fallback), takes it down,
+    installs any plugin release newer than what's recorded, then restarts and
+    verifies. If that still isn't healthy, stays in (or drops into) the
+    no-plugin fallback and waits for the next hour's release check."""
     state = load_state(cfg)
     if not state["broken"]:
         return
@@ -507,10 +519,13 @@ async def perform_recovery(cfg, manager, notify) -> None:
         return
 
     log.info("newer releases available for: %s", ", ".join(stale))
+    # In the broken state the server may still be up in the no-plugin fallback;
+    # wait for it to empty, then take it down before extracting over addons/,
+    # so players aren't disconnected mid-game and no plugin files are in use.
+    await _wait_for_empty_server(cfg, manager, notify, "the plugin update")
+    await manager.stop()
     installed = await asyncio.to_thread(_install_plugins_blocking, cfg, stale)
     state["installed"].update(installed)
-
-    await _wait_for_empty_server(cfg, manager, notify, "the plugin update")
     healthy = await restart_with_fallback(cfg, manager, state)
 
     if healthy and not state["broken"]:
