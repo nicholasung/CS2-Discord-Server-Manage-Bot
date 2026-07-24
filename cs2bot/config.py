@@ -133,6 +133,21 @@ class Config:
             problems.append(f"server.install_dir does not exist: {self.install_dir}")
         if not self.steam_library.is_dir():
             problems.append(f"server.steam_library does not exist: {self.steam_library}")
+        # steamcmd's +force_install_dir re-tokenizes its argument on whitespace,
+        # so a path with a space (e.g. ".../Counter-Strike Global Offensive")
+        # gets silently truncated at the first space and steamcmd installs into
+        # the wrong directory -- the server then keeps running old files from
+        # the real path while every update lands somewhere else. Refuse to start
+        # rather than let that happen invisibly. steam_library is what we pass to
+        # force_install_dir (it falls back to install_dir), so checking it covers
+        # both; a space-free symlink to a spaced dir is fine and passes this.
+        if " " in str(self.steam_library):
+            problems.append(
+                f"server.steam_library / install_dir contains a space: {self.steam_library}\n"
+                "    steamcmd's +force_install_dir truncates the path at the first space and "
+                "will install to the WRONG directory. Use a space-free path -- rename the "
+                "install dir (e.g. .../steamapps/common/cs2) or point it at a space-free symlink."
+            )
         if not shutil.which("tmux"):
             problems.append("tmux is not installed or not on PATH (required to run the CS2 console)")
         if not shutil.which(self.steamcmd):
