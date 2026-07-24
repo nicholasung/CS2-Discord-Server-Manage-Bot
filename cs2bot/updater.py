@@ -13,7 +13,6 @@ import asyncio
 import collections
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -110,10 +109,10 @@ _STATE_FILES_MISSING = 0x20
 
 def _classify_steamcmd_failure(returncode: int, output: str) -> tuple[str, str]:
     """Map a failed run to (human_reason, kind). kind drives what happens next:
-    'disk_full' -> prune configured client-only content and retry (retrying
-    alone won't help); 'files_missing' -> clear steamcmd's interrupted-download
-    leftovers and retry once with validate; 'content_servers' / 'other' ->
-    transient, retry with backoff."""
+    'disk_full' -> clear steamcmd's scratch/staging leftovers and retry once
+    (retrying alone won't help); 'files_missing' -> clear those leftovers and
+    retry once with validate; 'content_servers' / 'other' -> transient, retry
+    with backoff."""
     if _DISK_FULL_RE.search(output):
         return "not enough disk space on the install volume", "disk_full"
     state = _APP_STATE_RE.search(output)
@@ -138,9 +137,9 @@ def _classify_steamcmd_failure(returncode: int, output: str) -> tuple[str, str]:
 
 # steamcmd's own scratch/staging dirs (relative to the Steam library root):
 # partial downloads and temp files left by an interrupted update. Never
-# installed game content, regenerated on demand, so always safe to clear when
-# we need room -- done automatically on a disk-full failure, ahead of any user
-# prune_paths.
+# installed game content, regenerated on demand, so always safe to clear --
+# done automatically on a disk-full failure (to reclaim stale leftovers) and
+# as the first repair step for a files-missing install state.
 _STEAMCMD_SCRATCH = ("steamapps/downloading", "steamapps/temp")
 
 
@@ -148,7 +147,8 @@ def _clear_scratch(cfg) -> None:
     """Remove steamcmd's partial-download/staging leftovers. Never installed
     game content and regenerated on demand, so always safe; the first repair
     step when steamcmd reports the install is missing files (a half-applied
-    update sitting in steamapps/downloading is the usual cause)."""
+    update sitting in steamapps/downloading is the usual cause), and the
+    reclaim step on a disk-full failure."""
     for rel in _STEAMCMD_SCRATCH:
         path = cfg.steam_library / rel
         if path.is_dir() and not path.is_symlink():
@@ -156,77 +156,91 @@ def _clear_scratch(cfg) -> None:
             log.info("cleared steamcmd scratch %s", path)
 
 
-def _path_size(path: Path) -> int:
-    """Bytes used by a file or (recursively) a directory, not following
-    symlinks."""
-    if path.is_file():
-        return path.stat().st_size
-    total = 0
-    for p in path.rglob("*"):
+# steamcmd caches Steam's published app metadata (appcache/appinfo.vdf) and the
+# depot manifests it downloads (depotcache/), and records the installed build in
+# steamapps/appmanifest_<app_id>.acf. When any of these goes stale, `app_update`
+# trusts the local copy, decides the install already matches, and downloads
+# nothing -- steamcmd reports "already up to date" and prints the current build
+# while the files on disk stay behind. Connecting clients compare the server's
+# version (game/csgo/steam.inf) against live CS2 and are rejected with a
+# "version mismatch", even though steamcmd -- and `validate`, which only
+# re-hashes against that same stale manifest -- insist nothing is wrong.
+# Deleting these caches forces steamcmd to re-fetch fresh metadata from Steam on
+# the next run; all of it is regenerated on demand, so none is irreplaceable
+# game content. The next run must be a `validate` so the on-disk files are
+# reconciled against the freshly downloaded manifest.
+
+def _steamcmd_roots(cfg) -> list[Path]:
+    """Dirs that may hold steamcmd's appcache. Unlike the install manifest and
+    depotcache (which land under force_install_dir = steam_library), appcache
+    lives next to steamcmd's own bootstrap -- its install dir, or the per-user
+    copy the Debian /usr/games/steamcmd wrapper makes under ~/.steam / the XDG
+    data dir. We can't know which, so any configured server.steamcmd_data_dirs
+    come first, then every usual location, and the caller deletes
+    appcache/appinfo.vdf wherever it actually exists."""
+    roots: list[Path] = list(getattr(cfg, "steamcmd_data_dirs", []))
+    exe = shutil.which(cfg.steamcmd) or cfg.steamcmd
+    exe_parent = Path(exe).parent
+    if str(exe_parent) not in ("", "."):
+        roots.append(exe_parent)
+    home = Path.home()
+    roots += [
+        home / "Steam",
+        home / ".steam" / "steam",
+        home / ".steam",
+        home / ".local" / "share" / "Steam",
+        cfg.steam_library,
+    ]
+    seen: set = set()
+    unique: list[Path] = []
+    for r in roots:
         try:
-            if p.is_file() and not p.is_symlink():
-                total += p.stat().st_size
+            key = r.resolve()
         except OSError:
-            pass
-    return total
+            continue
+        if key not in seen:
+            seen.add(key)
+            unique.append(r)
+    return unique
 
 
-def _free_disk_space(cfg) -> int:
-    """Make room for an update that failed for lack of space. Always clears
-    steamcmd's scratch/staging dirs first (safe leftovers from interrupted
-    runs, under the Steam library root), then deletes any configured
-    prune_paths -- client-only content a dedicated server doesn't need, under
-    the game dir. A plain app_update won't re-download pruned content, so the
-    space stays freed (a `validate` would re-fetch it, which the bot runs only
-    as the one-time files-missing repair in _run_steamcmd_blocking).
-    Safety rails: never removes a symlink (would drop custom-content links),
-    never a path listed in `symlinks`, and never anything outside the library
-    root. Returns bytes freed."""
-    lib_root = cfg.steam_library.resolve()
-    protected = {os.path.realpath(s["link"]) for s in cfg.symlinks if s.get("link")}
-    freed = 0
-    # scratch dirs are relative to the library root; prune_paths (game content)
-    # are relative to the game dir.
-    targets = [(cfg.steam_library, p) for p in _STEAMCMD_SCRATCH]
-    targets += [(cfg.install_dir, p) for p in cfg.prune_paths]
-    for base, pattern in targets:
-        try:
-            matched = list(base.glob(pattern))
-        except ValueError as e:
-            log.warning("prune: bad pattern %r (use a path relative to its base): %s", pattern, e)
-            continue
-        if not matched:
-            log.info("prune: nothing matched %r", pattern)
-            continue
-        for path in matched:
-            if path.is_symlink():
-                continue
-            real = path.resolve()
-            if lib_root not in real.parents:
-                log.warning("prune: skipping %s (outside %s)", path, lib_root)
-                continue
-            if str(real) in protected:
-                continue
-            try:
-                size = _path_size(path)
-                if path.is_dir():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink()
-                freed += size
-                log.info("prune: removed %s (%.1f GB)", path, size / 1e9)
-            except OSError as e:
-                log.warning("prune: could not remove %s: %s", path, e)
-    if freed:
-        log.info("prune: freed %.1f GB total", freed / 1e9)
-    return freed
+def _remove_path(path: Path) -> None:
+    """Delete a file, symlink, or directory tree, logging what went. A missing
+    path is fine (nothing to clear); a permission error is logged, not raised,
+    so one unreadable candidate can't abort the rest of the repair."""
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            return
+        log.info("cleared %s", path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning("could not clear %s: %s", path, e)
+
+
+def _clear_update_caches(cfg) -> None:
+    """Clear the steamcmd caches that make `app_update` wrongly report the
+    install is up to date (see the note above): the interrupted-download scratch
+    dirs, the install manifest, the downloaded depot manifests, and steamcmd's
+    cached app metadata wherever it lives. Safe -- steamcmd regenerates all of
+    it on the next run, which must be a `validate` to re-reconcile the files."""
+    log.info("clearing steamcmd update caches to force a fresh metadata fetch")
+    _clear_scratch(cfg)
+    _remove_path(cfg.steam_library / "steamapps" / f"appmanifest_{cfg.app_id}.acf")
+    _remove_path(cfg.steam_library / "depotcache")
+    for root in _steamcmd_roots(cfg):
+        _remove_path(root / "appcache" / "appinfo.vdf")
 
 
 def _ensure_symlinks(cfg) -> None:
     """Recreate any configured custom-content symlinks that have gone missing,
-    so an update or a prune can never leave the server without its linked
-    maps/cfgs. Existing links (and real files at the link path) are left
-    alone."""
+    so an update can never leave the server without its linked maps/cfgs (a
+    `validate` can strip files it doesn't recognize). Existing links (and real
+    files at the link path) are left alone."""
     for s in cfg.symlinks:
         link, target = s.get("link"), s.get("target")
         if not link or not target:
@@ -271,19 +285,19 @@ def with_debug_tail(message: str, detail: str) -> str:
 def _run_steamcmd_blocking(cfg, validate: bool = False) -> tuple[bool, str, str]:
     """Run steamcmd, recovering where we can: transient (content-server/network)
     failures are retried with backoff; a disk-full failure triggers a one-time
-    prune of configured client-only content, then a retry; a files-missing app
-    state (interrupted update, e.g. 0x626) triggers a one-time scratch cleanup
-    and a retry with `validate` so steamcmd re-verifies the whole install.
-    validate=True (the /validate admin command) forces that verify/repair pass
-    from the first attempt instead of waiting for a files-missing failure.
-    Configured symlinks are re-verified after any run that touched files.
-    Returns (ok, reason, debug); on failure `reason` is a short human-readable
-    string and `debug` is the exact command, exit code, and output tail of the
-    last attempt (both "" on success)."""
+    cleanup of steamcmd's scratch/staging leftovers, then a retry; a
+    files-missing app state (interrupted update, e.g. 0x626) triggers the same
+    scratch cleanup and a retry with `validate` so steamcmd re-verifies the
+    whole install. validate=True (the /validate admin command) forces that
+    verify/repair pass from the first attempt instead of waiting for a
+    files-missing failure. Configured symlinks are re-verified after any
+    successful run. Returns (ok, reason, debug); on failure `reason` is a short
+    human-readable string and `debug` is the exact command, exit code, and
+    output tail of the last attempt (both "" on success)."""
     log.info("running steamcmd app_update %s%s", cfg.app_id, " validate" if validate else "")
     reason = ""
     returncode, output, attempt = 0, "", 0
-    pruned = False
+    scratch_cleared = False
     for attempt in range(1, STEAMCMD_MAX_ATTEMPTS + 1):
         returncode, output = _run_steamcmd_once(cfg, validate=validate)
         if returncode == 0:
@@ -301,15 +315,11 @@ def _run_steamcmd_blocking(cfg, validate: bool = False) -> tuple[bool, str, str]
             log.info("cleared download leftovers; retrying with validate to repair the install")
             continue  # retry now; validate re-fetches whatever is missing
 
-        if kind == "disk_full" and not pruned:
-            pruned = True
-            freed = _free_disk_space(cfg)
-            _ensure_symlinks(cfg)
-            if freed > 0:
-                log.info("freed %.1f GB; retrying update immediately", freed / 1e9)
-                continue  # retry now; the space problem should be gone
-            log.error("nothing to free (no scratch leftovers, no prune_paths matched)")
-            break
+        if kind == "disk_full" and not scratch_cleared:
+            scratch_cleared = True
+            _clear_scratch(cfg)
+            log.info("cleared steamcmd scratch to reclaim stale leftovers; retrying update once")
+            continue  # retry now; if the disk is genuinely too small this fails again and stops
 
         transient = kind in ("content_servers", "other")
         if not transient or attempt == STEAMCMD_MAX_ATTEMPTS:
@@ -420,7 +430,7 @@ async def restart_with_fallback(cfg, manager, state: dict | None = None) -> bool
 
 
 async def perform_daily_update(cfg, manager, notify, manual: bool = False,
-                               validate: bool = False) -> None:
+                               validate: bool = False, clear_caches: bool = False) -> None:
     """Wait for the server to empty, stop it, run steamcmd, and if CS2
     changed (or we're recovering from a broken state) update plugins, then
     start and verify -- falling back to a no-plugin launch if the update
@@ -436,8 +446,13 @@ async def perform_daily_update(cfg, manager, notify, manual: bool = False,
 
     validate=True (the /validate admin command) forces steamcmd's full
     verify/repair pass -- every file re-hashed against the depot, anything
-    damaged or missing re-fetched. Slow, and it re-downloads pruned content;
-    the on-demand repair for an install the automatic recovery couldn't fix."""
+    damaged or missing re-fetched. Slow; the on-demand repair for an install
+    the automatic recovery couldn't fix.
+
+    clear_caches=True (the /force-update admin command) wipes steamcmd's stale
+    caches first and forces a validate -- the fix for a stuck update where
+    steamcmd insists the install is up to date but connecting clients get a
+    version mismatch (see _clear_update_caches)."""
     state = load_state(cfg)
     old_build = read_buildid(cfg)
 
@@ -447,11 +462,21 @@ async def perform_daily_update(cfg, manager, notify, manual: bool = False,
     # admin-triggered update still won't disconnect players mid-game.
     await _wait_for_empty_server(cfg, manager, notify, "the CS2 update")
     await manager.stop()
+    if clear_caches:
+        # Break a stuck "already up to date": wipe steamcmd's stale caches,
+        # then force a validate so it re-fetches fresh metadata and content.
+        validate = True
+        await asyncio.to_thread(_clear_update_caches, cfg)
     ok, reason, debug = await asyncio.to_thread(_run_steamcmd_blocking, cfg, validate)
     if not ok:
         # steamcmd failed; bring the server back on the old build, in
         # whatever plugin mode it was already in, and move on
-        action = "install validation" if validate else "daily update"
+        if clear_caches:
+            action = "forced update"
+        elif validate:
+            action = "install validation"
+        else:
+            action = "daily update"
         await manager.start(plugins_enabled=not state["plugins_disabled"])
         await manager.wait_healthy()
         await notify(with_debug_tail(
@@ -486,7 +511,12 @@ async def perform_daily_update(cfg, manager, notify, manual: bool = False,
     elif changed:
         await notify(f"✅ CS2 updated to build {new_build}; plugins refreshed, server healthy.")
     elif manual:
-        checked = "Install validated; no" if validate else "No"
+        if clear_caches:
+            checked = "Caches cleared and install re-validated; no"
+        elif validate:
+            checked = "Install validated; no"
+        else:
+            checked = "No"
         await notify(
             f"✅ {checked} new CS2 build (still `{new_build or 'unknown'}`); server restarted, healthy."
         )

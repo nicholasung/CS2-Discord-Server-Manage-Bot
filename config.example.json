@@ -15,6 +15,11 @@
     "install_dir": "/home/USERNAME/cs2",
     "steam_library": "",
     "steamcmd": "steamcmd",
+    "steamcmd_data_dirs": [
+      "/home/USERNAME/Steam",
+      "/home/USERNAME/.steam/steam",
+      "/home/USERNAME/.local/share/Steam"
+    ],
     "app_id": 730,
     "launch_script": "/home/USERNAME/Desktop/start_cs2.sh",
     "launch_cwd": "",
@@ -32,7 +37,6 @@
     "daily_minute": 30,
     "recovery_interval_hours": 1,
     "player_check_interval_seconds": 300,
-    "prune_paths": [],
     "symlinks": []
   },
   "join": {

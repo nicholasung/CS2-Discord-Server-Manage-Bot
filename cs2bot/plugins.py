@@ -21,18 +21,26 @@ MATCHZY_REPO = "shobhit-pathak/MatchZy"
 
 PLUGINS = ("metamod", "cssharp", "matchzy")
 
-# Operator-edited files that plugin release zips also ship as templates
-# (paths relative to game/csgo, as stored in the zips). Once one of these
+# Operator-edited files that plugin release archives also ship as templates
+# (paths relative to game/csgo, as stored in the archives). Once one of these
 # exists on disk it is never overwritten by a plugin (re)install -- daily
-# updates and recovery reinstalls would otherwise reset admin lists to the
-# upstream template. A first install still extracts the template, since
-# nothing exists yet. Add more paths here to protect other local edits.
+# updates and recovery reinstalls would otherwise reset admin lists, saved
+# data, and third-party plugin registrations to the upstream template. A
+# first install still extracts the template, since nothing exists yet. Add
+# more paths here to protect other local edits.
 PRESERVED_CONFIGS = frozenset({
     "addons/counterstrikesharp/configs/admins.json",
     "addons/counterstrikesharp/configs/admin_groups.json",
     "addons/counterstrikesharp/configs/core.json",
+    # Metamod's alternative plugin-loading registry: third-party Metamod
+    # plugins registered here (instead of via their own .vdf in addons/)
+    # would silently stop loading if the stock file replaced it.
+    "addons/metamod/metaplugins.ini",
     "cfg/MatchZy/admins.json",
     "cfg/MatchZy/whitelist.cfg",
+    "cfg/MatchZy/config.cfg",        # operator-tuned match settings
+    "cfg/MatchZy/database.json",     # can hold MySQL credentials
+    "cfg/MatchZy/savednades.json",   # players' practice-mode lineups
 })
 
 
@@ -95,18 +103,31 @@ def _extract_zip(data: bytes, dest: Path):
 
 def extract_tar(tf: tarfile.TarFile, dest: Path):
     """extractall with the same guarantees _extract_zip enforces for zips:
-    the extracting user always keeps rw(x) on what it extracted, and
-    ownership is never taken from the archive -- an unfiltered extractall
-    running as root (easy to hit on a first-run bootstrap) chowns files to
-    whatever uids the upstream build machine stored, leaving them unwritable
-    by the bot's own user on the next update. The stdlib 'data' filter
-    (3.12+, and the PEP 706 backports to 3.8.17/3.9.17/3.10.12/3.11.4) does
-    both; older pythons get a manual mode fix-up instead."""
+    PRESERVED_CONFIGS that already exist on disk are never overwritten, the
+    extracting user always keeps rw(x) on what it extracted, and ownership
+    is never taken from the archive -- an unfiltered extractall running as
+    root (easy to hit on a first-run bootstrap) chowns files to whatever
+    uids the upstream build machine stored, leaving them unwritable by the
+    bot's own user on the next update. The stdlib 'data' filter (3.12+, and
+    the PEP 706 backports to 3.8.17/3.9.17/3.10.12/3.11.4) handles the
+    permission/ownership side; older pythons get a manual mode fix-up.
+    Members are filtered lazily so this works on streaming (r|gz) tars."""
+    extracted: list[tarfile.TarInfo] = []
+
+    def members():
+        for m in tf:
+            name = os.path.normpath(m.name)
+            if name in PRESERVED_CONFIGS and (dest / name).exists():
+                log.info("keeping existing %s (local edits preserved)", name)
+                continue
+            extracted.append(m)
+            yield m
+
     if hasattr(tarfile, "data_filter"):
-        tf.extractall(dest, filter="data")
+        tf.extractall(dest, members=members(), filter="data")
         return
-    tf.extractall(dest)
-    for m in tf.getmembers():
+    tf.extractall(dest, members=members())
+    for m in extracted:
         if not (m.isfile() or m.isdir()):
             continue
         try:

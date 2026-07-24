@@ -7,10 +7,10 @@ Manages a CS2 dedicated server (Metamod:Source + CounterStrikeSharp + MatchZy) o
 ## What it does
 
 - **Discord slash commands**, gated by Discord role:
-  - **Admin role**: `/join`, `/restart`, `/map <name|workshop-id>`, `/gamemode <mode> [map]`, `/update`, `/validate`, `/reinstall-plugins`, `/status`
+  - **Admin role**: `/join`, `/restart`, `/map <name|workshop-id>`, `/gamemode <mode> [map]`, `/update`, `/validate`, `/force-update`, `/reinstall-plugins`, `/status`
   - **User role**: recognized but has no commands yet (add them with the `user_only()` check in [cs2bot/bot.py](cs2bot/bot.py))
 - **Pinned join board.** `/join` posts an embed with the connect string, `steam://` link, and online/offline status, then pins it in the channel it was run in. The bot keeps that same message edited in place (a background loop checks every `join.refresh_seconds`) as the server goes up or down, and running `/join` again retires the old board and posts a fresh one wherever you run it — so members always have one persistent, up-to-date place to see how to join.
-- **Daily update** (runs at a configurable time, default 06:30): stops the server, runs `steamcmd +login anonymous +app_update 730`, and — if the CS2 buildid changed — updates Metamod, CounterStrikeSharp, and MatchZy to their latest releases and re-patches `gameinfo.gi` (CS2 updates wipe the Metamod entry). Then it starts the server back up and verifies it came up healthy. `/update` runs this same cycle on demand — including the empty-server wait and the full stop before steamcmd — and, unlike the scheduled run, reports the "no new build" outcome instead of staying silent about it. `/validate` is the same cycle with steamcmd's full verify/repair pass forced (`app_update 730 validate`): every file re-hashed against the depot, anything damaged or missing re-fetched — slow, and it re-downloads pruned content, so it's the on-demand deep repair rather than a routine check. Only one update/reinstall runs at a time; invoking one while another is in flight is refused.
+- **Daily update** (runs at a configurable time, default 06:30): stops the server, runs `steamcmd +login anonymous +app_update 730`, and — if the CS2 buildid changed — updates Metamod, CounterStrikeSharp, and MatchZy to their latest releases and re-patches `gameinfo.gi` (CS2 updates wipe the Metamod entry). Then it starts the server back up and verifies it came up healthy. `/update` runs this same cycle on demand — including the empty-server wait and the full stop before steamcmd — and, unlike the scheduled run, reports the "no new build" outcome instead of staying silent about it. `/validate` is the same cycle with steamcmd's full verify/repair pass forced (`app_update 730 validate`): every file re-hashed against the depot, anything damaged or missing re-fetched — slow, so it's the on-demand deep repair rather than a routine check. `/force-update` goes one step further: it **clears steamcmd's stale caches** (the install manifest, the downloaded depot manifests, and `appcache/appinfo.vdf`) and then validates — the fix for a stuck update where steamcmd insists the server is already up to date but connecting clients get a *version mismatch* ([see below](#stuck-update-repair-version-mismatch-but-steamcmd-says-up-to-date)). Only one update/reinstall runs at a time; invoking one while another is in flight is refused.
 - **No-plugin fallback**: if a CS2 update leaves the server unable to start with plugins (a common occurrence right after a game update, before plugin authors ship a compatible release), the bot automatically restarts it *without* Metamod/CSSharp/MatchZy — by removing the Metamod entry from `gameinfo.gi` — so the server stays up and playable on vanilla CS2 instead of sitting down entirely.
 - **Hourly recovery**: if a start ever fails (with or without plugins), the server is flagged *broken*. Every hour the bot checks whether any of the three plugins has published a newer release; when one has, it installs it and tries restarting with plugins again — falling back to no-plugins once more if that release is still incompatible — repeating until a release actually works and the flag clears. When the server isn't broken, the hourly check is a no-op.
 - **Won't interrupt an active game.** Before the daily update, a manual `/update` or `/validate`, a manual `/reinstall-plugins`, or an hourly recovery restart actually stops/restarts the server, the bot checks the current player count over RCON (`status`). If anyone's connected, it defers — rechecking every `update.player_check_interval_seconds` (default 60) — and only proceeds once the server is empty, posting a status-channel notice when it starts deferring and when it resumes. The wait rides out transient RCON hiccups (a busy server, a map change) by tolerating up to 3 consecutive failed checks before concluding RCON is down for good; and if it does have to give up after announcing it was deferring, it says so in the status channel rather than proceeding silently. In every case the server is then fully stopped before steamcmd or a plugin extraction touches the install, so no game files are in use while they're rewritten. Only `/restart` skips the empty-server check — it's the deliberate "restart right now" command, and doesn't rewrite any files.
@@ -98,6 +98,7 @@ Trade-offs versus the systemd unit: no automatic restart if the desktop session 
 | `rcon.*` | RCON host/port/password (or `RCON_PASSWORD` env var) |
 | `server.install_dir` | The game directory — contains `game/csgo/`. In a standard Steam library this is `<steam_library>/steamapps/common/Counter Strike Global Offensive` |
 | `server.steam_library` | The Steam **library root** holding the game (the dir with `steamapps/appmanifest_730.acf`), used for `force_install_dir`, the buildid read, and scratch cleanup. Leave `""` for a flat `force_install_dir` install (defaults to `install_dir`); for a standard library set it a few levels up, e.g. `/home/USER/Steam`. **Getting this wrong makes steamcmd write a duplicate install instead of updating in place** — see below |
+| `server.steamcmd_data_dirs` | Dir(s) — a string or a list — holding steamcmd's `appcache/appinfo.vdf`, cleared by [`/force-update`](#stuck-update-repair-version-mismatch-but-steamcmd-says-up-to-date). appcache lives with steamcmd's own bootstrap, not under `steam_library`. The bot searches these first, then always also checks steamcmd's install dir and the usual spots (`~/Steam`, `~/.steam/steam`, `~/.local/share/Steam`), so this is only strictly needed to pin a non-standard location. The example pre-fills the usual per-user paths (edit `USERNAME`) as a starting point; leaving it `[]` searches those same spots automatically |
 | `server.launch_script` | Your existing launcher; the bot runs this to start the server |
 | `server.launch_cwd` | Working dir for the launcher (defaults to the script's folder) |
 | `server.start_timeout_seconds` | How long to wait for startup markers before calling a start failed |
@@ -110,8 +111,7 @@ Trade-offs versus the systemd unit: no automatic restart if the desktop session 
 | `update.daily_hour` / `daily_minute` | Local time for the daily update run |
 | `update.recovery_interval_hours` | How often to retry recovery while broken (default 1) |
 | `update.player_check_interval_seconds` | While a daily update/recovery restart is deferred for active players, how often to recheck (default 60) |
-| `update.prune_paths` | Extra globs (relative to `install_dir`) deleted to free space on a disk-full update, on top of the always-safe scratch cleanup, before one automatic retry. For client-only content a dedicated server doesn't need. Empty (default) = scratch cleanup only. See [Disk-full recovery](#disk-full-recovery) |
-| `update.symlinks` | Custom-content symlinks — `[{"link": ..., "target": ...}]` — re-created after any update/prune so maps/cfgs linked into the install dir survive. Never deleted by pruning |
+| `update.symlinks` | Custom-content symlinks — `[{"link": ..., "target": ...}]` — re-created after any successful update so maps/cfgs linked into the install dir survive (a `validate` can strip files it doesn't recognize). See [Custom-content symlinks](#custom-content-symlinks) |
 | `gamemodes` | Map of mode name → list of RCON commands; `/gamemode` appends a map change |
 | `join.host` | Public IP/hostname players connect to; `/join` refuses to post a board until this is set |
 | `join.port` | Game port players connect to (default `27015`; separate from `rcon.port` if you split them) |
@@ -131,7 +131,7 @@ daily HH:MM  players online? → defer (recheck every player_check_interval_seco
              stop server → steamcmd app_update 730
              ├─ steamcmd failed → classify:
              │    ├─ transient (content servers / 0x202) → retry w/ backoff (up to 3x)
-             │    ├─ disk full → clear steamcmd scratch (+ prune_paths), retry once
+             │    ├─ disk full → clear steamcmd scratch, retry once
              │    ├─ files missing (interrupted update, e.g. 0x626) → clear scratch, retry once with validate
              │    └─ still failing → restart on old build (same plugin mode), notify ⚠️ with reason
              └─ ok → buildid changed (or was broken)?
@@ -153,38 +153,35 @@ hourly       not broken → no-op
 
 Plugin sources: Metamod:Source dev builds from `mms.alliedmods.net`, CounterStrikeSharp (`with-runtime` linux build) and MatchZy from their GitHub latest releases.
 
-> Plugin archives are extracted over the existing install, refreshing plugin binaries but leaving files that only exist locally in place. Operator-edited files that the releases *also* ship as templates — CSSharp's `admins.json`/`admin_groups.json`/`core.json`, MatchZy's `admins.json`/`whitelist.cfg` — are never overwritten once they exist on disk (see `PRESERVED_CONFIGS` in [cs2bot/plugins.py](cs2bot/plugins.py) to protect more).
+> Plugin archives are extracted over the existing install, refreshing plugin binaries but never deleting anything — files that only exist locally (third-party CSSharp/Metamod plugins, their configs, custom cfgs) are untouched. Operator-edited files that the releases *also* ship as templates — CSSharp's admin/core configs, MatchZy's `admins.json`/`whitelist.cfg`/`config.cfg`/`database.json`/`savednades.json`, Metamod's `metaplugins.ini` — are never overwritten once they exist on disk (see `PRESERVED_CONFIGS` in [cs2bot/plugins.py](cs2bot/plugins.py) to protect more). One caveat for third-party CSSharp plugins: a reinstall pulls the *latest* CounterStrikeSharp, so a plugin compiled against an older API may stop loading until its author ships an update — its files survive, but compatibility isn't guaranteed.
 
 ## Disk-full recovery
 
-When `steamcmd` aborts an update for lack of space (it reports `Error! App '730' state is 0x202` and exits `8`, having transferred nothing), the bot frees room and retries the update once.
+When `steamcmd` aborts an update for lack of space (it reports `Error! App '730' state is 0x202` and exits `8`, having transferred nothing), the bot clears steamcmd's own scratch/staging dirs — `<steam_library>/steamapps/downloading` and `.../temp`, i.e. partial downloads and temp files left by interrupted updates — and retries the update once. These are never installed game content and steamcmd regenerates them, so this is always safe. It reclaims *stale* leftovers from earlier failed runs; it won't fix a fundamentally too-small disk (the retry re-downloads the current update's data), and if the retry hits the same shortage the update simply fails cleanly onto the old build — it won't loop.
 
-**By default (no config), it clears steamcmd's own scratch/staging dirs** — `<steam_library>/steamapps/downloading` and `.../temp`, i.e. partial downloads and temp files left by interrupted updates. These are never installed game content and steamcmd regenerates them, so this is always safe. It reclaims *stale* leftovers from earlier failed runs; it won't fix a fundamentally too-small disk (the retry re-downloads the current update's data).
+## Custom-content symlinks
 
-**For a genuine shortage** — where the install itself no longer fits with headroom — you can additionally list game content to delete via `update.prune_paths`. This is opt-in because CS2 packs most assets (maps, models, sounds) into `pak01_*.vpk` archives the **server also needs**, so there's no large safe list to ship:
+Maps/cfgs you've linked *into* the install dir (e.g. a workshop-maps folder living on another volume) are re-created after every successful update, so they self-heal if a `validate` strips files it doesn't recognize. Configure them under `update.symlinks`:
 
 ```jsonc
 "update": {
-  "prune_paths": [
-    // ONLY paths you've confirmed a headless server boots and loads maps without.
-    // e.g. client-only UI videos, if present on your build:
-    "game/csgo/panorama/videos"
-  ],
   "symlinks": [
     { "link": "/home/USER/cs2/game/csgo/maps/workshop", "target": "/home/USER/cs2-workshop-maps" }
   ]
 }
 ```
 
-- `prune_paths` are globs **relative to `install_dir`**. Verify each one against your own install before adding it — a wrong entry (e.g. a VPK the server needs) breaks map loading.
-- **Safety rails:** pruning never removes a symlink, never removes a path listed in `symlinks`, and never touches anything outside `install_dir`. If nothing can be freed, the update just fails cleanly onto the old build — it won't loop.
-- `symlinks` you've linked *into* the install dir (custom maps/cfgs) are re-created after every update or prune, so they self-heal if anything removes them.
+Existing links (and real files already at the link path) are left alone; only missing ones are recreated.
 
-> **Why the freed space stays freed:** the bot normally runs a plain `app_update`, which trusts the local manifest and won't re-download files you deleted. Avoid running `steamcmd +app_update 730 validate` against this install by hand — a `validate` re-hashes everything and pulls the pruned content back, refilling the disk. The exceptions are the bot's own interrupted-update repair below and the manual `/validate` command, which accept that trade-off to get a broken install working again.
+## Stuck-update repair (version mismatch, but steamcmd says up to date)
+
+Sometimes `steamcmd +app_update 730` prints `Success! App '730' already up to date` (and the *new* version number) while connecting clients are still rejected with a **version mismatch** — the running server is serving old game files even though steamcmd swears it's current. This happens because steamcmd trusts what it has cached locally: the install manifest (`steamapps/appmanifest_730.acf`), the depot manifests it downloaded (`depotcache/`), and Steam's published app metadata (`appcache/appinfo.vdf`). When any of those goes stale, `app_update` decides the install already matches and downloads nothing, so the files on disk — and the version in `game/csgo/steam.inf` that clients check — stay behind. A plain `/validate` can't fix it either, because it just re-hashes against that same stale manifest.
+
+`/force-update` automates the manual cache-clearing fix: it deletes the install manifest, the depot cache, `appcache/appinfo.vdf` (searched in steamcmd's install dir and the usual per-user Steam roots — `~/Steam`, `~/.steam/steam`, `~/.local/share/Steam`, plus anything in `server.steamcmd_data_dirs` if your steamcmd keeps its cache somewhere non-standard), and the download scratch dirs, then re-runs steamcmd **with `validate`** so it re-fetches fresh metadata from Steam and reconciles the actual files. All of the deleted files are caches steamcmd regenerates on demand — no installed game content is touched — so the only cost is the re-validate. If steamcmd can't reach Steam after the clear, the server is simply restarted on the existing files (unchanged) and the next successful run rewrites the manifest.
 
 ## Interrupted-update repair (files missing, e.g. state 0x626)
 
-If a steamcmd run dies partway through an update (reboot, kill, crash), the app manifest can be left recording missing files — later runs then fail with `Error! App '730' state is 0x626` (any state with the `0x20` *files missing* bit set). Retrying a plain `app_update` can't repair this, so when the bot sees it, it clears steamcmd's half-applied download leftovers (`steamapps/downloading`, `steamapps/temp`) and re-runs **once with `validate`**, which re-verifies the whole install and re-fetches whatever is actually missing. The same repair can be forced anytime with the `/validate` admin command. Note this also re-downloads anything you removed via `prune_paths`; if that refills the disk, the normal disk-full recovery takes over on the next attempt.
+If a steamcmd run dies partway through an update (reboot, kill, crash), the app manifest can be left recording missing files — later runs then fail with `Error! App '730' state is 0x626` (any state with the `0x20` *files missing* bit set). Retrying a plain `app_update` can't repair this, so when the bot sees it, it clears steamcmd's half-applied download leftovers (`steamapps/downloading`, `steamapps/temp`) and re-runs **once with `validate`**, which re-verifies the whole install and re-fetches whatever is actually missing. The same repair can be forced anytime with the `/validate` admin command.
 
 If the failure is instead about *permissions* — files owned by root or another user because steamcmd/the bootstrap once ran under `sudo`, typically surfacing as steamcmd exit 254 (unwritable steamcmd state dir) or update jobs aborting partway — repair ownership with:
 

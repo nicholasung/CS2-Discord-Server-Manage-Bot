@@ -4,7 +4,7 @@ One process does everything:
   * launches/supervises the CS2 server as a child (see ServerManager)
   * serves role-gated slash commands
       Admin role: /join, /restart, /map, /gamemode, /update, /validate,
-                  /reinstall-plugins, /status
+                  /force-update, /reinstall-plugins, /status
       User role:  recognized, but has no commands yet — add them under the
                   user_only() check when the time comes.
   * runs the daily steamcmd update and the hourly plugin-recovery loops
@@ -257,10 +257,12 @@ async def gamemode(interaction: discord.Interaction, mode: str, map: str = ""):
         await interaction.followup.send(f"❌ RCON error: {e}")
 
 
-async def _run_manual_update(interaction: discord.Interaction, opening: str, validate: bool):
-    """Shared body of /update and /validate: refuse if an update is already
-    running, acknowledge immediately (the empty-server wait can run long past
-    any deferral window), then run the update cycle under the lock."""
+async def _run_manual_update(interaction: discord.Interaction, opening: str,
+                             validate: bool, clear_caches: bool = False):
+    """Shared body of /update, /validate, and /force-update: refuse if an
+    update is already running, acknowledge immediately (the empty-server wait
+    can run long past any deferral window), then run the update cycle under the
+    lock."""
     if _update_lock.locked():
         await interaction.response.send_message(
             "⏳ An update or reinstall is already in progress; watch the status channel.",
@@ -278,7 +280,9 @@ async def _run_manual_update(interaction: discord.Interaction, opening: str, val
         await notify(message)
 
     async with _update_lock:
-        await updater.perform_daily_update(cfg, bot.manager, relay, manual=True, validate=validate)
+        await updater.perform_daily_update(
+            cfg, bot.manager, relay, manual=True, validate=validate, clear_caches=clear_caches
+        )
     if outcome:
         try:
             await interaction.followup.send(outcome[-1], ephemeral=True)
@@ -310,10 +314,28 @@ async def validate_install(interaction: discord.Interaction):
     await _run_manual_update(
         interaction,
         "🔎 Validating the CS2 install: steamcmd re-hashes every game file and "
-        "re-downloads anything damaged or missing — this can take a while (and "
-        "re-fetches any pruned content). If players are online I'll wait for the "
-        "server to empty first. Progress is posted to the status channel.",
+        "re-downloads anything damaged or missing — this can take a while. If "
+        "players are online I'll wait for the server to empty first. Progress "
+        "is posted to the status channel.",
         validate=True,
+    )
+
+
+@bot.tree.command(
+    name="force-update",
+    description="Fix a stuck update (clears steamcmd caches + validates) when clients get a version mismatch (admin)",
+)
+@admin_only()
+async def force_update_repair(interaction: discord.Interaction):
+    await _run_manual_update(
+        interaction,
+        "🧹 Forcing a CS2 update: clearing steamcmd's stale caches (the app-info/depot "
+        "cache and install manifest) and re-validating. This fixes the case where steamcmd "
+        "insists the server is up to date but connecting clients get a **version mismatch**. "
+        "It re-downloads changed content and can take a while. If players are online I'll wait "
+        "for the server to empty first. Progress is posted to the status channel.",
+        validate=False,  # forced on internally alongside the cache clear
+        clear_caches=True,
     )
 
 

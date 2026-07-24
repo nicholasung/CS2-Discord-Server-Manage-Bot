@@ -51,6 +51,18 @@ class Config:
         # if steamcmd isn't on PATH. subprocess handles PATH lookup for a
         # bare name, so no hard-coded install location is assumed.
         self.steamcmd = s.get("steamcmd", "steamcmd")
+        # Where steamcmd keeps its appcache (appcache/appinfo.vdf) -- the stale
+        # metadata the /force-update repair clears to break a stuck "already up
+        # to date" update. Unlike the game files, appcache lives next to
+        # steamcmd's own bootstrap, NOT under force_install_dir, and its
+        # location varies (steamcmd's install dir, or the per-user ~/.steam /
+        # ~/.local/share/Steam copy the Debian wrapper makes). The repair
+        # already searches those usual spots; set this to pin an unusual one.
+        # Accepts a single path string or a list of them; searched first.
+        _data = s.get("steamcmd_data_dirs", [])
+        if isinstance(_data, str):
+            _data = [_data] if _data else []
+        self.steamcmd_data_dirs = [Path(p) for p in _data]
         self.app_id = int(s.get("app_id", 730))
         self.launch_script = s.get("launch_script", "/home/steam/Desktop/start_cs2.sh")
         _cwd = s.get("launch_cwd")
@@ -84,18 +96,9 @@ class Config:
         # How often to recheck player count while an update/restart is
         # deferred waiting for the server to empty out.
         self.player_check_interval_seconds = int(u.get("player_check_interval_seconds", 60))
-        # Disk-full recovery. When steamcmd aborts for lack of space, the bot
-        # always clears steamcmd's own scratch/staging dirs, then deletes these
-        # extra paths (globs, relative to install_dir) before retrying once.
-        # Meant for client-only content a dedicated server doesn't need; a
-        # plain app_update won't re-download them (only a `validate` would,
-        # which the bot runs solely to repair a files-missing install state,
-        # re-fetching pruned content as a side effect). Symlinks and anything
-        # in `symlinks` are never touched. Empty (default) = scratch cleanup
-        # only.
-        self.prune_paths = [str(p) for p in u.get("prune_paths", [])]
-        # Custom-content symlinks to (re)create after any update/prune, so
-        # maps/cfgs linked into the install dir survive. Each entry is
+        # Custom-content symlinks to (re)create after any successful update, so
+        # maps/cfgs linked into the install dir survive (a `validate` can strip
+        # files it doesn't recognize). Each entry is
         # {"link": <path>, "target": <path>}.
         self.symlinks = [dict(s) for s in u.get("symlinks", [])]
 
