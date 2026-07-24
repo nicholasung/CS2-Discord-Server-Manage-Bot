@@ -74,6 +74,12 @@ def _steamcmd_cmd(cfg, validate: bool = False) -> list[str]:
         cfg.steamcmd,
         "+force_install_dir", str(cfg.steam_library),
         "+login", "anonymous",
+        # Force a fresh app-info fetch from Steam's backend before deciding
+        # whether an update is needed, instead of trusting whatever's cached
+        # in appcache/appinfo.vdf (which /force-update also deletes outright,
+        # but a plain /update or the daily run don't -- this closes that gap
+        # on every run, not just the explicit repair).
+        "+app_info_update", "1",
         "+app_update", *app_update,
         "+quit",
     ]
